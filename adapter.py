@@ -38,6 +38,13 @@ def _plugin_version() -> str:
         return ""
 
 
+def _as_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _parse_iso(value) -> float:
     text = str(value or "").strip()
     if not text:
@@ -54,6 +61,7 @@ DEFAULT_CONFIG = {
     "auto_reply": True,
     "reply_probability": 0.1,
     "reply_mention_user": True,
+    "notify_title_only": False,
 }
 
 CONFIG_METADATA = {
@@ -87,6 +95,11 @@ CONFIG_METADATA = {
         "type": "bool",
         "hint": "回复本身已挂在对方楼层下，这里只控制是否再 @ 用户",
     },
+    "notify_title_only": {
+        "description": "只给 AI 主题标题，由它决定是否查看/回复",
+        "type": "bool",
+        "hint": "开启后通知只附带标题，AI 需要时自己调用 discourse_read_topic；可显著减少提示词长度",
+    },
 }
 
 
@@ -107,8 +120,10 @@ class DiscourseAdapter(Platform):
     CONTEXT_RECENT_POST_CHARS = 400
     # 同一主题在此时间内只允许发一条回复：模型重试/分段插件会拖到几十秒后才发
     DUPLICATE_WINDOW = 120
-    # LLM 决定跳过某条通知后，这段时间内该主题的残留文本一律丢弃
+    # LLM 决定跳过某条通知后，这段时间内该目标的残留文本一律丢弃
     SKIP_WINDOW = 600
+    # 聊天通知类型：chat_mention / chat_message / chat_quoted
+    CHAT_TYPES = {29, 30, 33}
 
     def __init__(self, config: dict, settings: dict, event_queue: asyncio.Queue):
         super().__init__(config, event_queue)
@@ -119,15 +134,16 @@ class DiscourseAdapter(Platform):
         self.typing_duration = max(
             3001, int(config.get("typing_duration_msecs") or 20000)
         )
-        raw_types = config.get("notification_types") or [1, 2, 3, 6, 15]
+        raw_types = config.get("notification_types") or [1, 2, 3, 6, 15, 29, 30, 33]
         try:
             self.notification_types = {int(item) for item in raw_types}
         except (TypeError, ValueError):
-            self.notification_types = {1, 2, 3, 6, 15}
+            self.notification_types = {1, 2, 3, 6, 15, 29, 30, 33}
 
         self.token = str(config.get("token") or "").strip()
         self.auto_reply = bool(config.get("auto_reply", True))
         self.reply_mention_user = bool(config.get("reply_mention_user", True))
+        self.notify_title_only = bool(config.get("notify_title_only", False))
         try:
             probability = float(config.get("reply_probability", 0.1))
         except (TypeError, ValueError):
@@ -154,10 +170,13 @@ class DiscourseAdapter(Platform):
         self._last_seen_notification_id = 0
         self._self_username = ""
         self._emitted_posts: set[tuple[int, int]] = set()
+        self._emitted_chat: set[tuple[int, int]] = set()
         # 主题 -> (引用前缀, 楼层号)：供会话纯文本回帖路径复用同一个引用
         self._pending_replies: dict[int, tuple[str, int]] = {}
-        # 主题 -> 跳过时间：LLM 决定不回复后，后续残留文本不再发帖
-        self._skipped_replies: dict[int, float] = {}
+        # "topic:12" / "chat:3" -> 跳过时间：LLM 决定不回复后，残留文本不再发帖
+        self._skipped_targets: dict[str, float] = {}
+        # 聊天频道 -> 最近一次发消息时间，用于去重
+        self._chat_replied_at: dict[int, float] = {}
         try:
             self.store = StateStore(StarTools.get_data_dir("astrbot_plugin_discourse"))
         except Exception:  # noqa: BLE001
@@ -250,6 +269,10 @@ class DiscourseAdapter(Platform):
         if notification_type not in self.notification_types:
             return
 
+        if notification_type in self.CHAT_TYPES:
+            await self._emit_chat_notification(notification, notification_type)
+            return
+
         data = notification.get("data") or {}
         post_id = data.get("original_post_id")
         topic_id = notification.get("topic_id")
@@ -285,7 +308,7 @@ class DiscourseAdapter(Platform):
             return
 
         # 同一主题来了新通知，解除上一次“决定不回复”的拦截，避免误伤后续回复
-        self._skipped_replies.pop(int(topic_id or 0), None)
+        self._skipped_targets.pop(f"topic:{int(topic_id or 0)}", None)
 
         username = str(post.get("username") or data.get("display_username") or "未知")
         user_id = post.get("user_id") or data.get("original_user_id") or username
@@ -336,8 +359,8 @@ class DiscourseAdapter(Platform):
             )
             return
 
-        # 提及 / 引用 / 群组提及：必须回复，不走概率
-        forced_reply = notification_type in (1, 3, 15)
+        # 提及 / 引用 / 群组提及 / 私信：必须回复，不走概率
+        forced_reply = notification_type in (1, 3, 6, 15)
         # 回复了你的帖子（自己主题或别人主题里的楼层）：交给 LLM 判断要不要回
         let_llm_decide = notification_type == 2
 
@@ -378,45 +401,61 @@ class DiscourseAdapter(Platform):
 
         reply_prefix = self._build_reply_prefix(topic_id, post_number, username)
 
-        message_str = (
-            f"[论坛通知] @{username} 在主题《{title or '未命名'}》"
-            f"（ID:{topic_id}）中{action_text}：\n\n{content}\n\n"
-        )
-        context_block = await self._topic_context(
-            int(topic_id or 0), int(post_number or 0)
-        )
-        if context_block:
-            message_str += (
-                f"【主题上下文】（只含主楼和最近 {self.CONTEXT_RECENT_POSTS} 楼，"
-                f"已按长度截断）\n{context_block}\n\n"
+        if self.notify_title_only:
+            message_str = (
+                f"[论坛通知] @{username} 在主题《{title or '未命名'}》"
+                f"（ID:{topic_id}）{action_text}。\n\n"
+                "通知这里只提供标题，是否查看或回复由你决定：\n"
+                f"- 想了解具体内容：discourse_read_topic(topic_id=\"{topic_id}\")\n"
+                f"- 决定回复：discourse_publish_reply(topic_id=\"{topic_id}\", content=\"你的回复正文\")\n"
+                "- 不想回复：discourse_skip_reply\n"
+                "直接输出文字也会被当成回帖，所以不回复时只能用 discourse_skip_reply。"
             )
-        message_str += (
-            f"需要更多楼层请调用 discourse_read_topic(topic_id=\"{topic_id}\")。"
-            f"回复时请调用 discourse_publish_reply(topic_id=\"{topic_id}\", content=\"你的回复正文\")，"
-            f"topic_id 和 content 两个参数都必须提供。"
-            "系统会自动把回复挂到对方楼层下"
-            + ("并 @ 对方" if self.reply_mention_user else "")
-            + "，正文里不要再自己写 [quote] 或重复 @对方。"
-            "需要 @ 其他人时，先用 discourse_search_user 确认用户名存在，"
-            "再把用户名填进 discourse_publish_reply 的 mentions 参数。"
-            "调用了回复工具后就不要再输出额外文字，否则会重复发帖。"
-        )
-        if forced_reply:
-            message_str += (
-                "\n\n【对方主动提及或引用了你，必须回复】"
-                "请调用 discourse_publish_reply 回复。"
-                "只有内容明显是骚扰或垃圾信息时，才可以调用 discourse_skip_reply 跳过，"
-                "或先用 discourse_block_user 拉黑对方再跳过。"
-                "不要直接输出文字，直接输出也会被当成回帖。"
+            if forced_reply:
+                message_str += (
+                    "\n【这条属于提及/引用/私信，必须回复】"
+                    "先读取内容再回复；只有骚扰或垃圾内容才允许跳过或拉黑。"
+                )
+        else:
+            message_str = (
+                f"[论坛通知] @{username} 在主题《{title or '未命名'}》"
+                f"（ID:{topic_id}）中{action_text}：\n\n{content}\n\n"
             )
-        elif let_llm_decide:
-            message_str += (
-                "\n\n【对方回复了你的帖子】"
-                "请你自行判断这条回复是否值得回应："
-                "值得就调用 discourse_publish_reply 回复；"
-                "觉得没必要就不用回，调用 discourse_skip_reply 明确跳过。"
-                "注意：直接输出文字也会被当成回帖，所以不回复时只能用 discourse_skip_reply。"
+            context_block = await self._topic_context(
+                int(topic_id or 0), int(post_number or 0)
             )
+            if context_block:
+                message_str += (
+                    f"【主题上下文】（只含主楼和最近 {self.CONTEXT_RECENT_POSTS} 楼，"
+                    f"已按长度截断）\n{context_block}\n\n"
+                )
+            message_str += (
+                f"需要更多楼层请调用 discourse_read_topic(topic_id=\"{topic_id}\")。"
+                f"回复时请调用 discourse_publish_reply(topic_id=\"{topic_id}\", content=\"你的回复正文\")，"
+                f"topic_id 和 content 两个参数都必须提供。"
+                "系统会自动把回复挂到对方楼层下"
+                + ("并 @ 对方" if self.reply_mention_user else "")
+                + "，正文里不要再自己写 [quote] 或重复 @对方。"
+                "需要 @ 其他人时，先用 discourse_search_user 确认用户名存在，"
+                "再把用户名填进 discourse_publish_reply 的 mentions 参数。"
+                "调用了回复工具后就不要再输出额外文字，否则会重复发帖。"
+            )
+            if forced_reply:
+                message_str += (
+                    "\n\n【对方主动提及/引用/私信了你，必须回复】"
+                    "请调用 discourse_publish_reply 回复。"
+                    "只有内容明显是骚扰或垃圾信息时，才可以调用 discourse_skip_reply 跳过，"
+                    "或先用 discourse_block_user 拉黑对方再跳过。"
+                    "不要直接输出文字，直接输出也会被当成回帖。"
+                )
+            elif let_llm_decide:
+                message_str += (
+                    "\n\n【对方回复了你的帖子】"
+                    "请你自行判断这条回复是否值得回应："
+                    "值得就调用 discourse_publish_reply 回复；"
+                    "觉得没必要就不用回，调用 discourse_skip_reply 明确跳过。"
+                    "注意：直接输出文字也会被当成回帖，所以不回复时只能用 discourse_skip_reply。"
+                )
 
         abm = AstrBotMessage()
         abm.self_id = self.platform_id
@@ -453,6 +492,131 @@ class DiscourseAdapter(Platform):
             topic_id,
             notification_type,
         )
+
+    async def _emit_chat_notification(
+        self, notification: dict, notification_type: int
+    ) -> None:
+        """Discourse Chat 通知（聊天直接消息 / 频道提及）。"""
+        data = notification.get("data") or {}
+        channel_id = _as_int(data.get("chat_channel_id"))
+        message_id = _as_int(data.get("chat_message_id"))
+        if channel_id <= 0:
+            logger.info(
+                "[DiscourseAdapter] 聊天通知 %s 缺少频道 ID，跳过",
+                notification.get("id"),
+            )
+            return
+        if len(self._emitted_chat) > 2000:
+            self._emitted_chat.clear()
+        if message_id and (channel_id, message_id) in self._emitted_chat:
+            logger.info(
+                "[DiscourseAdapter] 聊天消息 %s#%s 已处理过，跳过通知 %s",
+                channel_id,
+                message_id,
+                notification.get("id"),
+            )
+            return
+
+        try:
+            payload = await self.api.chat_messages(self.credential, channel_id, 5)
+        except DiscourseError as exc:
+            logger.info(
+                "[DiscourseAdapter] 读取聊天频道 %s 消息失败：%s",
+                channel_id,
+                exc.message,
+            )
+            return
+
+        messages = payload.get("messages") or []
+        message = None
+        if message_id:
+            message = next(
+                (item for item in messages if _as_int(item.get("id")) == message_id),
+                None,
+            )
+        if not message:
+            # 通知没带可用的消息 ID 时，取最后一条不是自己发的
+            for item in reversed(messages):
+                if self._self_username and self._chat_username(item) == self._self_username:
+                    continue
+                message = item
+                break
+        if not message:
+            logger.info(
+                "[DiscourseAdapter] 聊天频道 %s 没有找到对应消息，跳过通知 %s",
+                channel_id,
+                notification.get("id"),
+            )
+            return
+
+        username = self._chat_username(message)
+        user = message.get("user") or {}
+        user_id = user.get("id") or username
+        if self._self_username and username == self._self_username:
+            return
+        if self.store is not None and self.store.is_blocked(user_id, username):
+            logger.info("[DiscourseAdapter] 聊天消息来自黑名单用户 @%s，跳过", username)
+            return
+
+        content = str(message.get("message") or "").strip()
+        if not content:
+            content = html_to_text(str(message.get("cooked") or "")).strip()
+        if not content:
+            content = str(message.get("excerpt") or "").strip()
+        if not content:
+            logger.info("[DiscourseAdapter] 聊天消息 %s 没有文本内容，跳过", message.get("id"))
+            return
+        if len(content) > 3000:
+            content = content[:3000] + "……"
+
+        is_dm = bool(data.get("is_direct_message_channel"))
+        channel_title = str(data.get("chat_channel_title") or "").strip()
+        channel_name = ("直接消息" if is_dm else (channel_title or f"频道 {channel_id}"))
+        if notification_type == 30 and not is_dm:
+            action_text = "在聊天频道里发了新消息"
+        else:
+            action_text = "在私聊里发来消息"
+
+        self._emitted_chat.add((channel_id, _as_int(message.get("id"))))
+
+        message_str = (
+            f"[论坛聊天] @{username} 在{channel_name}里{action_text}：\n\n{content}\n\n"
+            f"要回复请调用 discourse_send_chat_message(channel_id=\"{channel_id}\", "
+            "content=\"你的回复正文\")；不想回复就调用 discourse_skip_reply。"
+            "直接输出文字也会发到聊天，所以不回复时只能用 discourse_skip_reply。"
+        )
+
+        abm = AstrBotMessage()
+        abm.self_id = self.platform_id
+        abm.sender = MessageMember(user_id=str(user_id), nickname=username)
+        abm.type = MessageType.FRIEND_MESSAGE
+        abm.session_id = f"chat:{channel_id}"
+        abm.message_id = f"discourse_chat_{notification.get('id')}"
+        abm.message = [Plain(text=message_str)]
+        abm.message_str = message_str
+        abm.raw_message = notification
+        abm.timestamp = int(time.time())
+
+        event = self.create_event(abm)
+        event.set_extra("discourse_chat_channel_id", channel_id)
+        event.set_extra("discourse_chat_message_id", _as_int(message.get("id")))
+        event.set_extra("discourse_notification_type", notification_type)
+        event.set_extra("discourse_reply_username", username)
+        event.is_wake = True
+        event.is_at_or_wake_command = True
+
+        self.commit_event(event)
+        logger.info(
+            "[DiscourseAdapter] 已投递聊天通知：@%s -> 频道 %s（%s）",
+            username,
+            channel_id,
+            notification_type,
+        )
+
+    @staticmethod
+    def _chat_username(message: dict) -> str:
+        user = message.get("user") or {}
+        return str(message.get("username") or user.get("username") or "未知")
 
     def _build_reply_prefix(self, topic_id, post_number, username: str) -> str:
         """构造回复前缀：只保留可选的 @ 对方，不再写引用块。
@@ -537,14 +701,24 @@ class DiscourseAdapter(Platform):
                 text[:80],
             )
             return
-        topic_id = self._parse_topic_id(getattr(session, "session_id", ""))
+        session_id = str(getattr(session, "session_id", "") or "")
+        if session_id.startswith("chat:"):
+            channel_id = self._parse_topic_id(session_id)
+            if not channel_id:
+                logger.warning(
+                    "[DiscourseAdapter] 无法从会话解析聊天频道 ID：%s", session_id
+                )
+                return
+            await self.send_to_chat(channel_id, text)
+            return
+        topic_id = self._parse_topic_id(session_id)
         if not topic_id:
             logger.warning(
                 "[DiscourseAdapter] 无法从会话解析主题 ID：%s",
-                getattr(session, "session_id", ""),
+                session_id,
             )
             return
-        skipped_at = self._skipped_replies.get(topic_id)
+        skipped_at = self._skipped_targets.get(f"topic:{topic_id}")
         if skipped_at and time.time() - skipped_at < self.SKIP_WINDOW:
             logger.info(
                 "[DiscourseAdapter] LLM 已跳过主题 %s 的本次通知，丢弃会话文本",
@@ -559,18 +733,64 @@ class DiscourseAdapter(Platform):
             topic_id, text, reply_to_post_number=post_number
         )
 
-    def mark_skipped(self, topic_id: int) -> None:
-        """记录 LLM 已决定跳过该主题的本次通知。"""
-        topic_id = int(topic_id or 0)
-        if topic_id <= 0:
+    async def send_to_chat(self, channel_id: int, text: str) -> bool:
+        """把文本发到 Discourse 聊天频道（含直接消息）。"""
+        if not self.token:
+            logger.warning("[DiscourseAdapter] 未配置 token，无法发聊天消息。")
+            return False
+        channel_id = int(channel_id or 0)
+        if channel_id <= 0:
+            return False
+        if "<|" in text:
+            logger.warning(
+                "[DiscourseAdapter] 聊天消息含模型特殊标记，丢弃：%s", text[:80]
+            )
+            return False
+        skipped_at = self._skipped_targets.get(f"chat:{channel_id}")
+        if skipped_at and time.time() - skipped_at < self.SKIP_WINDOW:
+            logger.info(
+                "[DiscourseAdapter] LLM 已跳过聊天频道 %s 的本次消息，丢弃文本",
+                channel_id,
+            )
+            return False
+        last = self._chat_replied_at.get(channel_id, 0.0)
+        if time.time() - last < self.DUPLICATE_WINDOW:
+            logger.info(
+                "[DiscourseAdapter] 聊天频道 %s 刚刚已经回复过，忽略重复文本",
+                channel_id,
+            )
+            return False
+        try:
+            await self.api.chat_send(self.credential, channel_id, text)
+        except DiscourseError as exc:
+            logger.warning(
+                "[DiscourseAdapter] 发送聊天消息到频道 %s 失败：%s",
+                channel_id,
+                exc.message,
+            )
+            return False
+        self._chat_replied_at[channel_id] = time.time()
+        logger.info("[DiscourseAdapter] 已发送聊天消息到频道 %s", channel_id)
+        return True
+
+    def mark_skipped(self, key: str) -> None:
+        """记录 LLM 已决定跳过某个目标（"topic:12" 或 "chat:3"）。"""
+        key = str(key or "").strip()
+        if not key:
             return
         now = time.time()
-        self._skipped_replies = {
-            tid: stamp
-            for tid, stamp in self._skipped_replies.items()
+        self._skipped_targets = {
+            name: stamp
+            for name, stamp in self._skipped_targets.items()
             if now - stamp < self.SKIP_WINDOW
         }
-        self._skipped_replies[topic_id] = now
+        self._skipped_targets[key] = now
+
+    def mark_chat_replied(self, channel_id: int) -> None:
+        """记录已经通过工具发过聊天消息，避免纯文本再补发一条。"""
+        channel_id = int(channel_id or 0)
+        if channel_id > 0:
+            self._chat_replied_at[channel_id] = time.time()
 
     async def reply_to_topic(
         self, topic_id: int, text: str, reply_to_post_number: int = 0
