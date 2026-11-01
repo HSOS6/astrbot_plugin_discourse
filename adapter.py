@@ -177,6 +177,8 @@ class DiscourseAdapter(Platform):
         self._skipped_targets: dict[str, float] = {}
         # 聊天频道 -> 最近一次发消息时间，用于去重
         self._chat_replied_at: dict[int, float] = {}
+        # 论坛没启用聊天 / 无权访问时停止轮询
+        self._chat_poll_disabled = False
         try:
             self.store = StateStore(StarTools.get_data_dir("astrbot_plugin_discourse"))
         except Exception:  # noqa: BLE001
@@ -262,11 +264,24 @@ class DiscourseAdapter(Platform):
                     self._last_seen_notification_id, int(item.get("id") or 0)
                 )
 
+            # 聊天直接消息不一定产生通知，额外轮询一次频道做兜底
+            try:
+                await self._poll_chat_dms()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[DiscourseAdapter] 轮询聊天频道失败：%s", exc)
+
         await self.api.close()
 
     async def _emit_notification(self, notification: dict):
         notification_type = int(notification.get("notification_type") or 0)
         if notification_type not in self.notification_types:
+            logger.info(
+                "[DiscourseAdapter] 通知 %s 类型 %s 不在监听列表内，跳过",
+                notification.get("id"),
+                notification_type,
+            )
             return
 
         if notification_type in self.CHAT_TYPES:
@@ -370,9 +385,11 @@ class DiscourseAdapter(Platform):
             and random.random() > self.reply_probability
         ):
             logger.info(
-                "[DiscourseAdapter] 自动回复概率未命中（%.0f%%），跳过通知 %s（@%s -> 主题 %s）",
+                "[DiscourseAdapter] 自动回复概率未命中（%.0f%%），跳过通知 %s"
+                "（type=%s，@%s -> 主题 %s）",
                 self.reply_probability * 100,
                 notification.get("id"),
+                notification_type,
                 username,
                 topic_id,
             )
@@ -408,8 +425,8 @@ class DiscourseAdapter(Platform):
                 "通知这里只提供标题，是否查看或回复由你决定：\n"
                 f"- 想了解具体内容：discourse_read_topic(topic_id=\"{topic_id}\")\n"
                 f"- 决定回复：discourse_publish_reply(topic_id=\"{topic_id}\", content=\"你的回复正文\")\n"
-                "- 不想回复：discourse_skip_reply\n"
-                "直接输出文字也会被当成回帖，所以不回复时只能用 discourse_skip_reply。"
+                f"- 不想回复：discourse_skip_reply\n"
+                "调用工具后请输出一句很短的话（例如“已处理”），系统会忽略这段文字。"
             )
             if forced_reply:
                 message_str += (
@@ -438,7 +455,8 @@ class DiscourseAdapter(Platform):
                 + "，正文里不要再自己写 [quote] 或重复 @对方。"
                 "需要 @ 其他人时，先用 discourse_search_user 确认用户名存在，"
                 "再把用户名填进 discourse_publish_reply 的 mentions 参数。"
-                "调用了回复工具后就不要再输出额外文字，否则会重复发帖。"
+                "调用了回复工具后，只需输出一句很短的确认（例如“已回复”），"
+                "系统会自动忽略这段文字，不会重复发帖。"
             )
             if forced_reply:
                 message_str += (
@@ -446,7 +464,7 @@ class DiscourseAdapter(Platform):
                     "请调用 discourse_publish_reply 回复。"
                     "只有内容明显是骚扰或垃圾信息时，才可以调用 discourse_skip_reply 跳过，"
                     "或先用 discourse_block_user 拉黑对方再跳过。"
-                    "不要直接输出文字，直接输出也会被当成回帖。"
+                    "工具调用后输出一句短确认即可，系统会忽略。"
                 )
             elif let_llm_decide:
                 message_str += (
@@ -454,7 +472,7 @@ class DiscourseAdapter(Platform):
                     "请你自行判断这条回复是否值得回应："
                     "值得就调用 discourse_publish_reply 回复；"
                     "觉得没必要就不用回，调用 discourse_skip_reply 明确跳过。"
-                    "注意：直接输出文字也会被当成回帖，所以不回复时只能用 discourse_skip_reply。"
+                    "无论回不回，工具调用后都请输出一句短确认，系统会忽略这段文字。"
                 )
 
         abm = AstrBotMessage()
@@ -549,6 +567,35 @@ class DiscourseAdapter(Platform):
             )
             return
 
+        self._dispatch_chat_message(
+            channel_id=channel_id,
+            message=message,
+            channel_title=str(data.get("chat_channel_title") or "").strip(),
+            is_dm=bool(data.get("is_direct_message_channel")),
+            notification_type=notification_type,
+            source_id=str(notification.get("id") or ""),
+        )
+
+    @staticmethod
+    def _chat_username(message: dict) -> str:
+        user = message.get("user") or {}
+        return str(message.get("username") or user.get("username") or "未知")
+
+    def _dispatch_chat_message(
+        self,
+        channel_id: int,
+        message: dict,
+        channel_title: str = "",
+        is_dm: bool = False,
+        notification_type: int = 30,
+        source_id: str = "",
+    ) -> None:
+        """把一条聊天消息构造为 AstrBot 事件并投递。"""
+        message_id = _as_int(message.get("id"))
+        if len(self._emitted_chat) > 2000:
+            self._emitted_chat.clear()
+        if message_id and (channel_id, message_id) in self._emitted_chat:
+            return
         username = self._chat_username(message)
         user = message.get("user") or {}
         user_id = user.get("id") or username
@@ -564,26 +611,25 @@ class DiscourseAdapter(Platform):
         if not content:
             content = str(message.get("excerpt") or "").strip()
         if not content:
-            logger.info("[DiscourseAdapter] 聊天消息 %s 没有文本内容，跳过", message.get("id"))
+            logger.info("[DiscourseAdapter] 聊天消息 %s 没有文本内容，跳过", message_id)
             return
         if len(content) > 3000:
             content = content[:3000] + "……"
 
-        is_dm = bool(data.get("is_direct_message_channel"))
-        channel_title = str(data.get("chat_channel_title") or "").strip()
-        channel_name = ("直接消息" if is_dm else (channel_title or f"频道 {channel_id}"))
+        channel_name = "直接消息" if is_dm else (channel_title or f"频道 {channel_id}")
         if notification_type == 30 and not is_dm:
             action_text = "在聊天频道里发了新消息"
         else:
             action_text = "在私聊里发来消息"
 
-        self._emitted_chat.add((channel_id, _as_int(message.get("id"))))
+        self._emitted_chat.add((channel_id, message_id))
 
         message_str = (
             f"[论坛聊天] @{username} 在{channel_name}里{action_text}：\n\n{content}\n\n"
             f"要回复请调用 discourse_send_chat_message(channel_id=\"{channel_id}\", "
             "content=\"你的回复正文\")；不想回复就调用 discourse_skip_reply。"
-            "直接输出文字也会发到聊天，所以不回复时只能用 discourse_skip_reply。"
+            "直接输出文字也会发到聊天；不回复请调用 discourse_skip_reply，"
+            "然后再输出一句短确认，系统会忽略这段文字。"
         )
 
         abm = AstrBotMessage()
@@ -591,15 +637,15 @@ class DiscourseAdapter(Platform):
         abm.sender = MessageMember(user_id=str(user_id), nickname=username)
         abm.type = MessageType.FRIEND_MESSAGE
         abm.session_id = f"chat:{channel_id}"
-        abm.message_id = f"discourse_chat_{notification.get('id')}"
+        abm.message_id = f"discourse_chat_{source_id or message_id}"
         abm.message = [Plain(text=message_str)]
         abm.message_str = message_str
-        abm.raw_message = notification
+        abm.raw_message = message
         abm.timestamp = int(time.time())
 
         event = self.create_event(abm)
         event.set_extra("discourse_chat_channel_id", channel_id)
-        event.set_extra("discourse_chat_message_id", _as_int(message.get("id")))
+        event.set_extra("discourse_chat_message_id", message_id)
         event.set_extra("discourse_notification_type", notification_type)
         event.set_extra("discourse_reply_username", username)
         event.is_wake = True
@@ -607,16 +653,75 @@ class DiscourseAdapter(Platform):
 
         self.commit_event(event)
         logger.info(
-            "[DiscourseAdapter] 已投递聊天通知：@%s -> 频道 %s（%s）",
+            "[DiscourseAdapter] 已投递聊天消息：@%s -> 频道 %s（%s）",
             username,
             channel_id,
             notification_type,
         )
 
-    @staticmethod
-    def _chat_username(message: dict) -> str:
-        user = message.get("user") or {}
-        return str(message.get("username") or user.get("username") or "未知")
+    async def _poll_chat_dms(self) -> None:
+        """兜底轮询直接消息频道：论坛不产生聊天通知时也能收到私聊。"""
+        if self._chat_poll_disabled or self.store is None:
+            return
+        try:
+            payload = await self.api.chat_dm_channels(self.credential)
+        except DiscourseError as exc:
+            if exc.status in (403, 404):
+                self._chat_poll_disabled = True
+                logger.info(
+                    "[DiscourseAdapter] 论坛未启用聊天或无权访问，停止轮询聊天频道：%s",
+                    exc.message,
+                )
+            else:
+                logger.info("[DiscourseAdapter] 读取聊天频道列表失败：%s", exc.message)
+            return
+
+        for channel in payload.get("direct_message_channels") or []:
+            channel_id = _as_int(channel.get("id"))
+            if channel_id <= 0:
+                continue
+            try:
+                data = await self.api.chat_messages(self.credential, channel_id, 3)
+            except DiscourseError as exc:
+                logger.info(
+                    "[DiscourseAdapter] 读取聊天频道 %s 消息失败：%s",
+                    channel_id,
+                    exc.message,
+                )
+                continue
+            messages = data.get("messages") or []
+            if not messages:
+                continue
+            ids = [_as_int(item.get("id")) for item in messages]
+            latest = max(ids)
+            seen = self.store.chat_last_seen(channel_id)
+            if seen <= 0:
+                # 首次见到该频道只记录基线，不回复历史消息
+                self.store.mark_chat_seen(channel_id, latest)
+                logger.info(
+                    "[DiscourseAdapter] 聊天频道 %s 记录基线消息 %s", channel_id, latest
+                )
+                continue
+            if latest <= seen:
+                continue
+            target = None
+            for item in sorted(messages, key=lambda x: _as_int(x.get("id"))):
+                if _as_int(item.get("id")) <= seen:
+                    continue
+                if self._self_username and self._chat_username(item) == self._self_username:
+                    continue
+                target = item
+            self.store.mark_chat_seen(channel_id, latest)
+            if target is None:
+                continue
+            self._dispatch_chat_message(
+                channel_id=channel_id,
+                message=target,
+                channel_title=str(channel.get("title") or "").strip(),
+                is_dm=True,
+                notification_type=30,
+                source_id="poll",
+            )
 
     def _build_reply_prefix(self, topic_id, post_number, username: str) -> str:
         """构造回复前缀：只保留可选的 @ 对方，不再写引用块。
