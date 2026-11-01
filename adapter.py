@@ -150,8 +150,8 @@ class DiscourseAdapter(Platform):
     SKIP_WINDOW = 600
     # 聊天通知类型：chat_mention / chat_message / chat_quoted
     CHAT_TYPES = {29, 30, 33}
-    # 图片随文本发送 + 聊天私信支持
-    BUILD_TAG = "2026-11-02-img"
+    # 聊天消息原文直通，指令可正常触发
+    BUILD_TAG = "2026-11-02-chatcmd"
     # 其它插件发来的图片，先暂存这么久，等随下一条回复一起发；没等到就单独发
     IMAGE_HOLD_SECONDS = 15
 
@@ -654,10 +654,8 @@ class DiscourseAdapter(Platform):
         if len(content) > 3000:
             content = content[:3000] + "……"
 
-        if is_dm:
-            message_str = f"@{username}：\n{content}"
-        else:
-            message_str = f"[频道「{channel_title or channel_id}」] @{username}：\n{content}"
+        # 原文直接交给 AstrBot：任何前缀都会让 /help 等指令匹配失败
+        message_str = content
         self._emitted_chat.add((channel_id, message_id))
 
         abm = AstrBotMessage()
@@ -681,9 +679,10 @@ class DiscourseAdapter(Platform):
 
         self.commit_event(event)
         logger.info(
-            "[DiscourseAdapter] 已投递聊天消息：@%s -> 频道 %s（%s）",
+            "[DiscourseAdapter] 已投递聊天消息：@%s -> %s %s（%s）",
             username,
-            channel_id,
+            "私信" if is_dm else "频道",
+            channel_title or channel_id,
             notification_type,
         )
 
@@ -1039,17 +1038,40 @@ class DiscourseAdapter(Platform):
                 "[DiscourseAdapter] 聊天消息含模型特殊标记，丢弃：%s", text[:80]
             )
             return False
-        try:
-            await self.api.chat_send(self.credential, channel_id, text)
-        except DiscourseError as exc:
-            logger.warning(
-                "[DiscourseAdapter] 发送聊天消息到频道 %s 失败：%s",
-                channel_id,
-                exc.message,
-            )
-            return False
+        # 论坛单条聊天消息有长度上限，/help 这类指令输出要分段发
+        for chunk in self._chat_chunks(text, 4000):
+            try:
+                await self.api.chat_send(self.credential, channel_id, chunk)
+            except DiscourseError as exc:
+                logger.warning(
+                    "[DiscourseAdapter] 发送聊天消息到频道 %s 失败：%s",
+                    channel_id,
+                    exc.message,
+                )
+                return False
         logger.info("[DiscourseAdapter] 已发送聊天消息到频道 %s", channel_id)
         return True
+
+    @staticmethod
+    def _chat_chunks(text: str, limit: int) -> list[str]:
+        """按行把长文本切成不超过 limit 的若干段。"""
+        chunks: list[str] = []
+        current = ""
+        for line in text.splitlines(keepends=True):
+            while len(line) > limit:
+                if current:
+                    chunks.append(current.rstrip())
+                    current = ""
+                chunks.append(line[:limit])
+                line = line[limit:]
+            if len(current) + len(line) > limit:
+                chunks.append(current.rstrip())
+                current = line
+            else:
+                current += line
+        if current.strip():
+            chunks.append(current.rstrip())
+        return chunks or ([text] if text.strip() else [])
 
     def mark_skipped(self, key: str) -> None:
         """记录 LLM 已决定跳过某个目标（"topic:12" 或 "chat:3"）。"""
