@@ -908,11 +908,12 @@ class DiscourseAdapter(Platform):
         if topic_id <= 0:
             return False
         if self.store is not None and self.store.replied_within(
-            topic_id, self.DUPLICATE_WINDOW
+            topic_id, reply_to_post_number, self.DUPLICATE_WINDOW
         ):
             logger.info(
-                "[DiscourseAdapter] 主题 %s 刚刚已经回复过，忽略本次重复文本回复",
+                "[DiscourseAdapter] 主题 %s 第 %s 楼刚刚已经回复过，忽略本次重复文本回复",
                 topic_id,
+                reply_to_post_number,
             )
             return False
 
