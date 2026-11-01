@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from astrbot.api import logger
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import At, Plain
 from astrbot.api.platform import (
     AstrBotMessage,
     MessageMember,
@@ -150,8 +150,8 @@ class DiscourseAdapter(Platform):
     SKIP_WINDOW = 600
     # 聊天通知类型：chat_mention / chat_message / chat_quoted
     CHAT_TYPES = {29, 30, 33}
-    # 聊天消息原文直通，指令可正常触发
-    BUILD_TAG = "2026-11-02-chatcmd"
+    # 聊天消息原文直通，公共频道按群聊唤醒
+    BUILD_TAG = "2026-11-02-groupchat"
     # 其它插件发来的图片，先暂存这么久，等随下一条回复一起发；没等到就单独发
     IMAGE_HOLD_SECONDS = 15
 
@@ -658,13 +658,23 @@ class DiscourseAdapter(Platform):
         message_str = content
         self._emitted_chat.add((channel_id, message_id))
 
+        # 直接消息等同私聊；公共频道等同群聊：只有被 @ / 引用或被指令唤醒才响应
+        mentioned = notification_type in (29, 33)
         abm = AstrBotMessage()
         abm.self_id = self.platform_id
         abm.sender = MessageMember(user_id=str(user_id), nickname=username)
-        abm.type = MessageType.FRIEND_MESSAGE
+        abm.type = MessageType.FRIEND_MESSAGE if is_dm else MessageType.GROUP_MESSAGE
         abm.session_id = f"chat:{channel_id}"
+        if not is_dm:
+            abm.group_id = str(channel_id)
+            if channel_title:
+                abm.group.group_name = channel_title
         abm.message_id = f"discourse_chat_{source_id or message_id}"
-        abm.message = [Plain(text=message_str)]
+        components = [Plain(text=message_str)]
+        if mentioned and not is_dm:
+            # 群聊里被提及：补一个 At 自己，让 AstrBot 按群聊规则唤醒
+            components.insert(0, At(qq=str(self.platform_id), name=self._self_username or None))
+        abm.message = components
         abm.message_str = message_str
         abm.raw_message = message
         abm.timestamp = int(time.time())
@@ -674,8 +684,6 @@ class DiscourseAdapter(Platform):
         event.set_extra("discourse_chat_message_id", message_id)
         event.set_extra("discourse_notification_type", notification_type)
         event.set_extra("discourse_reply_username", username)
-        event.is_wake = True
-        event.is_at_or_wake_command = True
 
         self.commit_event(event)
         logger.info(
