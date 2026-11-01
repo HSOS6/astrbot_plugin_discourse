@@ -64,7 +64,6 @@ class DiscourseAPI:
                     headers["User-Api-Client-Id"] = client_id
         if self.host_header:
             base_host = urlparse(self.api_base).netloc
-
             if base_host != self.host_header:
                 headers["Host"] = self.host_header
         return headers
