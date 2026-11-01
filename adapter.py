@@ -878,7 +878,11 @@ class DiscourseAdapter(Platform):
                 size = f"|{max(1, width // 2)}x{max(1, height // 2)}" if width and height else ""
                 parts.append(f"![图片{size}]({url})")
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[DiscourseAdapter] 图片上传失败：%s", exc)
+                logger.warning(
+                    "[DiscourseAdapter] 图片上传失败（%s）：%s",
+                    type(exc).__name__,
+                    getattr(exc, "message", "") or exc,
+                )
         return "\n".join(parts)
 
     @staticmethod
