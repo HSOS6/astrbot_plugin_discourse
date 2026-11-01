@@ -253,6 +253,8 @@ class DiscourseForumPlugin(Star):
 
     def _validate_content(self, content: str) -> str | None:
         text = (content or "").strip()
+        if "<|" in text:
+            return "正文里混入了模型特殊标记（如 <|end|>），请重新组织语言后再发。"
         minimum = max(1, self._cfg_int("min_content_chars", 8))
         maximum = max(minimum, self._cfg_int("max_content_chars", 8000))
         if len(text) < minimum:
@@ -1515,10 +1517,10 @@ class DiscourseForumPlugin(Star):
         if ok:
             self._record_write(user_id)
             event.set_extra("discourse_tool_replied", True)
-            self.store.mark_replied(
-                topic_id,
-                int(post_number or event.get_extra("discourse_post_number") or 0),
-            )
+            # 只有明确回复了某一楼才记楼层；自动逛帖（无楼层）不能记成 topic:0，
+            # 否则该主题之后所有楼层的通知都会被当成“已回过”而跳过
+            if post_number:
+                self.store.mark_replied(topic_id, int(post_number))
         if created and event.get_extra("discourse_auto_engage"):
             replied = list(event.get_extra("discourse_auto_replied") or [])
             replied.append(topic_id)
