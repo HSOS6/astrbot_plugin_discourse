@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import random
 import re
 import time
@@ -177,6 +178,8 @@ class DiscourseAdapter(Platform):
         self._skipped_targets: dict[str, float] = {}
         # 聊天频道 -> 最近一次发消息时间，用于去重
         self._chat_replied_at: dict[int, float] = {}
+        # 主题 -> 最近一次发图片时间，用于去重（图片不占用楼层去重记录）
+        self._image_sent_at: dict[int, float] = {}
         # 论坛没启用聊天 / 无权访问时停止轮询
         self._chat_poll_disabled = False
         try:
@@ -798,9 +801,10 @@ class DiscourseAdapter(Platform):
 
     async def send_by_session(self, session, message_chain) -> None:
         text = (message_chain.get_plain_text() or "").strip()
-        if not text:
+        images = await self._images_markdown(message_chain)
+        if not text and not images:
             return
-        if "<|" in text:
+        if text and "<|" in text:
             logger.warning(
                 "[DiscourseAdapter] 模型输出含特殊标记，丢弃以免发到论坛：%s",
                 text[:80],
@@ -814,7 +818,9 @@ class DiscourseAdapter(Platform):
                     "[DiscourseAdapter] 无法从会话解析聊天频道 ID：%s", session_id
                 )
                 return
-            await self.send_to_chat(channel_id, text)
+            combined = "\n\n".join(part for part in (text, images) if part)
+            # 只有图片时不算“主动发言”，避免挡住下一条文字回复
+            await self.send_to_chat(channel_id, combined, remember=bool(text))
             return
         topic_id = self._parse_topic_id(session_id)
         if not topic_id:
@@ -831,6 +837,12 @@ class DiscourseAdapter(Platform):
             )
             self._pending_replies.pop(topic_id, None)
             return
+        if images and not text:
+            # 只有图片（例如其它插件发来的表情包）：单独发一层，不占用楼层去重记录
+            await self.send_image_reply(topic_id, images)
+            return
+        if images:
+            text = f"{text}\n\n{images}"
         prefix, post_number = self._pending_replies.pop(topic_id, ("", 0))
         if prefix and not text.lstrip().startswith(prefix):
             text = f"{prefix}\n\n{text}"
@@ -838,7 +850,81 @@ class DiscourseAdapter(Platform):
             topic_id, text, reply_to_post_number=post_number
         )
 
-    async def send_to_chat(self, channel_id: int, text: str) -> bool:
+    async def _images_markdown(self, message_chain) -> str:
+        """把消息链里的图片上传到论坛图床，返回 Markdown 图片标记。"""
+        parts: list[str] = []
+        for comp in getattr(message_chain, "chain", None) or []:
+            if type(comp).__name__ != "Image":
+                continue
+            try:
+                path = await comp.convert_to_file_path()
+                data = Path(path).read_bytes()
+                name = Path(path).name or "image.png"
+                mime = mimetypes.guess_type(name)[0] or "image/png"
+                if not mime.startswith("image/"):
+                    continue
+                data = self._shrink_image(data, mime)
+                result = await self.api.upload(self.credential, name, data, mime)
+                url = self.api.absolute_url(str(result.get("url") or ""))
+                parts.append(f"![图片]({url})")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[DiscourseAdapter] 图片上传失败：%s", exc)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _shrink_image(data: bytes, mime: str) -> bytes:
+        """静态图片缩小到 50%；GIF 保留原样，避免动图丢帧。"""
+        if mime == "image/gif":
+            return data
+        try:
+            import io
+
+            from PIL import Image as PILImage
+
+            with PILImage.open(io.BytesIO(data)) as img:
+                width, height = img.size
+                if width <= 0 or height <= 0:
+                    return data
+                resized = img.resize((max(1, width // 2), max(1, height // 2)))
+                out = io.BytesIO()
+                if mime in ("image/jpeg", "image/jpg"):
+                    resized.convert("RGB").save(out, format="JPEG", quality=85)
+                else:
+                    resized.save(out, format="PNG")
+                return out.getvalue()
+        except Exception:  # noqa: BLE001
+            return data
+
+    async def send_image_reply(self, topic_id: int, text: str) -> bool:
+        """把图片作为单独一层回帖发到主题。"""
+        if not self.token or not text:
+            return False
+        topic_id = int(topic_id or 0)
+        if topic_id <= 0:
+            return False
+        now = time.time()
+        if now - self._image_sent_at.get(topic_id, 0.0) < self.DUPLICATE_WINDOW:
+            logger.info(
+                "[DiscourseAdapter] 主题 %s 刚刚发过图片，忽略重复图片", topic_id
+            )
+            return False
+        payload = {
+            "topic_id": topic_id,
+            "raw": text,
+            "typing_duration_msecs": self.typing_duration,
+        }
+        try:
+            await self.api.create_post(self.credential, payload)
+        except DiscourseError as exc:
+            logger.warning(
+                "[DiscourseAdapter] 发送图片到主题 %s 失败：%s", topic_id, exc.message
+            )
+            return False
+        self._image_sent_at[topic_id] = now
+        logger.info("[DiscourseAdapter] 已发送图片到主题 %s", topic_id)
+        return True
+
+    async def send_to_chat(self, channel_id: int, text: str, remember: bool = True) -> bool:
         """把文本发到 Discourse 聊天频道（含直接消息）。"""
         if not self.token:
             logger.warning("[DiscourseAdapter] 未配置 token，无法发聊天消息。")
@@ -859,7 +945,7 @@ class DiscourseAdapter(Platform):
             )
             return False
         last = self._chat_replied_at.get(channel_id, 0.0)
-        if time.time() - last < self.DUPLICATE_WINDOW:
+        if remember and time.time() - last < self.DUPLICATE_WINDOW:
             logger.info(
                 "[DiscourseAdapter] 聊天频道 %s 刚刚已经回复过，忽略重复文本",
                 channel_id,
@@ -874,7 +960,8 @@ class DiscourseAdapter(Platform):
                 exc.message,
             )
             return False
-        self._chat_replied_at[channel_id] = time.time()
+        if remember:
+            self._chat_replied_at[channel_id] = time.time()
         logger.info("[DiscourseAdapter] 已发送聊天消息到频道 %s", channel_id)
         return True
 
