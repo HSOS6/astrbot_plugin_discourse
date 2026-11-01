@@ -872,11 +872,17 @@ class DiscourseForumPlugin(Star):
         Args:
             reason(string): 可选，不回复的原因，仅用于日志。
         """
-        topic_id = event.get_extra("discourse_topic_id") or "未知"
+        try:
+            topic_id = int(event.get_extra("discourse_topic_id") or 0)
+        except (TypeError, ValueError):
+            topic_id = 0
         event.set_extra("discourse_skip_reply", True)
+        adapter = getattr(event, "adapter", None)
+        if topic_id and hasattr(adapter, "mark_skipped"):
+            adapter.mark_skipped(topic_id)
         logger.info(
             "[Discourse] 跳过回复主题 %s：%s",
-            topic_id,
+            topic_id or "未知",
             str(reason or "").strip() or "未说明",
         )
         return "已跳过，本次不会在论坛发帖。请不要输出任何文字。"
