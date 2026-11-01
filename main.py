@@ -1494,7 +1494,7 @@ class DiscourseForumPlugin(Star):
         raw = content.strip()
         prefix = str(event.get_extra("discourse_reply_prefix") or "")
         if prefix and not event.get_extra("discourse_auto_engage"):
-            if not raw.lstrip().startswith("[quote="):
+            if not raw.lstrip().startswith(prefix):
                 raw = f"{prefix}\n\n{raw}"
         mention_suffix, missing_users = await self._resolve_mentions(mentions)
         raw += mention_suffix
