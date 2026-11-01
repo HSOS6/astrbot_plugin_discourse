@@ -1,0 +1,110 @@
+{
+  "site_url": {
+    "description": "Discourse 站点地址",
+    "type": "string",
+    "default": "https://xinjianya.top",
+    "hint": "用于生成帖子链接"
+  },
+  "token": {
+    "description": "论坛 Key（Discourse User API Key）",
+    "type": "string",
+    "default": "",
+    "hint": "登录论坛后打开 /astrbot-key（或偏好设置页的「生成 Key」按钮）获取；只填这一个 Key 即可"
+  },
+  "default_category": {
+    "description": "默认发帖类别 ID",
+    "type": "int",
+    "default": 6
+  },
+  "allowed_categories": {
+    "description": "允许发新主题的类别 ID 列表",
+    "type": "list",
+    "default": [6],
+    "hint": "只填机器人区的类别 ID；回复不受此限制"
+  },
+  "auto_post_enabled": {
+    "description": "允许 AI 主动发新主题",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时 AI 只能回帖；开启后仍受类别白名单和每日上限约束"
+  },
+  "auto_post_daily_limit": {
+    "description": "每天最多主动发几个新主题",
+    "type": "int",
+    "default": 2
+  },
+  "max_writes_per_hour": {
+    "description": "每个用户每小时写操作上限",
+    "type": "int",
+    "default": 6,
+    "hint": "发帖、回帖、删帖都计入，防止被刷"
+  },
+  "max_topic_posts": {
+    "description": "单次读取主题的最大楼层数",
+    "type": "int",
+    "default": 20
+  },
+  "max_post_chars": {
+    "description": "单楼内容最多返回的字符数",
+    "type": "int",
+    "default": 2000
+  },
+  "auto_browse_enabled": {
+    "description": "启用定时自动逛论坛",
+    "type": "bool",
+    "default": true,
+    "hint": "定时读取最新主题并推送到下面配置的会话"
+  },
+  "auto_browse_interval": {
+    "description": "自动逛论坛间隔（秒）",
+    "type": "int",
+    "default": 3600,
+    "hint": "最小 300 秒"
+  },
+  "auto_browse_sessions": {
+    "description": "接收论坛动态的会话列表",
+    "type": "list",
+    "default": [],
+    "hint": "填写 unified_msg_origin，例如 aiocqhttp:FriendMessage:123456；留空则不推送"
+  },
+  "auto_browse_autoreply": {
+    "description": "自动参与讨论（自动回帖）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后 AI 会阅读新主题并选择性回帖；关闭则只推送动态"
+  },
+  "auto_browse_autoreply_probability": {
+    "description": "每轮自动回帖的触发概率",
+    "type": "float",
+    "default": 0.1,
+    "hint": "0~1，0.1 表示约一成轮次会参与讨论"
+  },
+  "auto_browse_max_replies": {
+    "description": "每轮自动回帖最多几条",
+    "type": "int",
+    "default": 1
+  },
+  "auto_browse_reply_count": {
+    "description": "推送新主题时附带几条最新回复",
+    "type": "int",
+    "default": 3,
+    "hint": "自动逛论坛的摘要会带主楼和最近 N 楼；0 表示只看主楼"
+  },
+  "auto_browse_like_enabled": {
+    "description": "自动逛论坛时允许 AI 点赞",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 AI 读到好内容可以自己决定点赞，也会受下面的数量上限约束"
+  },
+  "auto_browse_max_likes": {
+    "description": "每轮自动逛论坛最多点赞几个",
+    "type": "int",
+    "default": 2
+  },
+  "auto_browse_engage_prompt": {
+    "description": "自定义自动逛帖提示词",
+    "type": "string",
+    "default": "",
+    "hint": "留空使用内置规则；填写后会作为提示词开头，后面自动附上新主题列表"
+  }
+}
