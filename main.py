@@ -1298,7 +1298,6 @@ class DiscourseForumPlugin(Star):
         replies.sort(key=lambda item: int(item.get("post_number") or 0))
         if not replies:
             return f"主题 {parsed_id} 第 {floor} 楼暂时没有楼中楼回复。"
-
         lines = [f"主题 {parsed_id} 第 {floor} 楼的回复（{len(replies)} 条）："]
         for post in replies[:limit]:
             text = html_to_text(str(post.get("cooked") or post.get("raw") or "")).strip()
