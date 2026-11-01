@@ -105,10 +105,10 @@ class DiscourseAdapter(Platform):
     CONTEXT_FIRST_POST_CHARS = 1200
     CONTEXT_RECENT_POSTS = 3
     CONTEXT_RECENT_POST_CHARS = 400
-    # 自动引用原楼层时最多摘取多少字符
-    QUOTE_CHARS = 500
-    # 同一主题在此时间内只允许发一条回复，避免工具回复后又被补发一条文本
-    DUPLICATE_WINDOW = 30
+    # 自动引用原楼层时最多摘取多少字符；整楼引用会被 Discourse 自动删掉
+    QUOTE_CHARS = 200
+    # 同一主题在此时间内只允许发一条回复：模型重试/分段插件会拖到几十秒后才发
+    DUPLICATE_WINDOW = 120
     # LLM 决定跳过某条通知后，这段时间内该主题的残留文本一律丢弃
     SKIP_WINDOW = 600
 
@@ -396,7 +396,7 @@ class DiscourseAdapter(Platform):
             f"需要更多楼层请调用 discourse_read_topic(topic_id=\"{topic_id}\")。"
             f"回复时请调用 discourse_publish_reply(topic_id=\"{topic_id}\", content=\"你的回复正文\")，"
             f"topic_id 和 content 两个参数都必须提供。"
-            "系统会自动引用对方原楼层"
+            "系统会自动带上引用（长楼层摘取前 200 字，短楼层由论坛原生回复指向）"
             + ("并 @ 对方" if self.reply_mention_user else "")
             + "，正文里不要再自己写 [quote] 或重复 @对方。"
             "需要 @ 其他人时，先用 discourse_search_user 确认用户名存在，"
@@ -459,7 +459,12 @@ class DiscourseAdapter(Platform):
     def _build_reply_prefix(
         self, post: dict, topic_id, post_number, username: str
     ) -> str:
-        """构造回复前缀：Discourse 原生引用块 + 可选 @ 对方。"""
+        """构造回复前缀：Discourse 原生引用块（仅长楼层）+ 可选 @ 对方。
+
+        Discourse 会自动移除“紧跟在原楼层后面、且引用了整楼原文”的引用块，
+        所以短楼层不写 [quote]，只靠 reply_to_post_number 指向原楼层；
+        长楼层只摘取前 QUOTE_CHARS 个字符加省略号，引用块才能保留下来。
+        """
         number = int(post_number or 0)
         tid = int(topic_id or 0)
         if tid <= 0 or number <= 0 or not username:
@@ -468,13 +473,15 @@ class DiscourseAdapter(Platform):
         if not quote_text:
             quote_text = html_to_text(str(post.get("cooked") or "")).strip()
         quote_text = quote_text.replace("[/quote]", "").strip()
+        lines: list[str] = []
         if len(quote_text) > self.QUOTE_CHARS:
-            quote_text = quote_text[: self.QUOTE_CHARS] + "……"
-        lines = [
-            f'[quote="{username}, post:{number}, topic:{tid}"]',
-            quote_text,
-            "[/quote]",
-        ]
+            lines.extend(
+                [
+                    f'[quote="{username}, post:{number}, topic:{tid}"]',
+                    quote_text[: self.QUOTE_CHARS] + "……",
+                    "[/quote]",
+                ]
+            )
         if self.reply_mention_user:
             lines.append(f"@{username}")
         return "\n".join(lines)
@@ -543,6 +550,12 @@ class DiscourseAdapter(Platform):
     async def send_by_session(self, session, message_chain) -> None:
         text = (message_chain.get_plain_text() or "").strip()
         if not text:
+            return
+        if "<|" in text:
+            logger.warning(
+                "[DiscourseAdapter] 模型输出含特殊标记，丢弃以免发到论坛：%s",
+                text[:80],
+            )
             return
         topic_id = self._parse_topic_id(getattr(session, "session_id", ""))
         if not topic_id:
@@ -615,7 +628,7 @@ class DiscourseAdapter(Platform):
             logger.info("[DiscourseAdapter] 回复主题 %s 已提交，等待审核", topic_id)
         else:
             logger.info("[DiscourseAdapter] 已回复主题 %s", topic_id)
-        if self.store is not None:
+        if self.store is not None and reply_to_post_number:
             self.store.mark_replied(topic_id, reply_to_post_number)
         return True
 
