@@ -56,7 +56,8 @@ class DiscourseMessageEvent(AstrMessageEvent):
             return
 
         text = (message.get_plain_text() or "").strip()
-        if not text:
+        images = await self._adapter.images_markdown(message)
+        if not text and not images:
             return
 
         if self.get_extra("discourse_skip_reply", False):
@@ -67,7 +68,19 @@ class DiscourseMessageEvent(AstrMessageEvent):
             return
 
         if self._chat_channel_id:
-            if await self._adapter.send_to_chat(self._chat_channel_id, text):
+            combined = "\n\n".join(part for part in (text, images) if part)
+            if await self._adapter.send_to_chat(
+                self._chat_channel_id, combined, remember=bool(text)
+            ):
+                self.set_extra("discourse_tool_replied", True)
+            return
+
+        if not self._topic_id:
+            logger.warning("[DiscourseAdapter] 事件没有主题 ID，无法把回复发回论坛。")
+            return
+
+        if images and not text:
+            if await self._adapter.send_image_reply(self._topic_id, images):
                 self.set_extra("discourse_tool_replied", True)
             return
 
@@ -77,9 +90,8 @@ class DiscourseMessageEvent(AstrMessageEvent):
             )
             return
 
-        if not self._topic_id:
-            logger.warning("[DiscourseAdapter] 事件没有主题 ID，无法把回复发回论坛。")
-            return
+        if images:
+            text = f"{text}\n\n{images}"
 
         prefix = str(self.get_extra("discourse_reply_prefix") or "")
         if prefix and not text.lstrip().startswith(prefix):
@@ -95,10 +107,17 @@ class DiscourseMessageEvent(AstrMessageEvent):
     async def send_streaming(self, generator, use_fallback: bool = False) -> None:
         """论坛不支持流式输出，收集完整文本后一次性回复。"""
         chunks: list[str] = []
+        images: list = []
         async for chain in generator:
             chunk = (chain.get_plain_text() or "").strip()
             if chunk:
                 chunks.append(chunk)
+            for comp in getattr(chain, "chain", None) or []:
+                if type(comp).__name__ == "Image":
+                    images.append(comp)
         text = "\n".join(chunks).strip()
-        if text:
-            await self.send(MessageChain().message(text))
+        if text or images:
+            message = MessageChain().message(text) if text else MessageChain()
+            for comp in images:
+                message.chain.append(comp)
+            await self.send(message)
