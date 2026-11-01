@@ -1380,14 +1380,20 @@ class DiscourseForumPlugin(Star):
         if isinstance(data, str):
             return data
 
-        try:
-            result = await self.api.upload(credential, filename, data, mime)
-        except DiscourseError as exc:
-            return f"上传失败：{exc.message}"
-        url = str(result.get("url") or result.get("short_url") or "")
-        if not url:
-            return "上传成功但论坛没有返回图片地址。"
-        full_url = self.api.absolute_url(url)
+        adapter = getattr(event, "adapter", None)
+        if hasattr(adapter, "upload_image_bytes"):
+            full_url = await adapter.upload_image_bytes(filename, data, mime)
+            if not full_url:
+                return "上传失败：所有图床都没有上传成功，请查看日志。"
+        else:
+            try:
+                result = await self.api.upload(credential, filename, data, mime)
+            except DiscourseError as exc:
+                return f"上传失败：{exc.message}"
+            url = str(result.get("url") or result.get("short_url") or "")
+            if not url:
+                return "上传成功但论坛没有返回图片地址。"
+            full_url = self.api.absolute_url(url)
         alt = str(description or "").strip() or "图片"
         self._record_write(self._user_id(event))
         return f"上传成功，正文里可以这样插入：\n![{alt}]({full_url})\n图片地址：{full_url}"
