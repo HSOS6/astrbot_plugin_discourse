@@ -1856,6 +1856,7 @@ class DiscourseForumPlugin(Star):
             "discourse_my_account",
             "discourse_publish_reply",
             "discourse_publish_comment",
+            "discourse_skip_reply",
             "discourse_like_post",
             "discourse_read_replies",
             "discourse_save_diary",
