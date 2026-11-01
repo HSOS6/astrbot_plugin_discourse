@@ -125,6 +125,8 @@ class DiscourseAdapter(Platform):
     SKIP_WINDOW = 600
     # 聊天通知类型：chat_mention / chat_message / chat_quoted
     CHAT_TYPES = {29, 30, 33}
+    # 图片随文本发送 + 聊天私信支持
+    BUILD_TAG = "2026-11-02-img"
     # 其它插件发来的图片，先暂存这么久，等随下一条回复一起发；没等到就单独发
     IMAGE_HOLD_SECONDS = 15
 
@@ -237,8 +239,9 @@ class DiscourseAdapter(Platform):
             (int(item.get("id") or 0) for item in notifications), default=0
         )
         logger.info(
-            "[DiscourseAdapter] v%s 已启动，基线通知 ID=%s，轮询间隔 %s 秒",
+            "[DiscourseAdapter] v%s（build %s）已启动，基线通知 ID=%s，轮询间隔 %s 秒",
             _plugin_version() or "?",
+            self.BUILD_TAG,
             self._last_seen_notification_id,
             self.poll_interval,
         )
