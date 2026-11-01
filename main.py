@@ -863,6 +863,22 @@ class DiscourseForumPlugin(Star):
             mentions=str(mentions or ""),
         )
 
+    @filter.llm_tool(name="discourse_skip_reply")
+    async def discourse_skip_reply(self, event: AstrMessageEvent, reason: str = "") -> str:
+        """收到论坛通知后决定不回复时调用，避免把思考文字误发成帖子。
+
+        Args:
+            reason(string): 可选，不回复的原因，仅用于日志。
+        """
+        topic_id = event.get_extra("discourse_topic_id") or "未知"
+        event.set_extra("discourse_skip_reply", True)
+        logger.info(
+            "[Discourse] 跳过回复主题 %s：%s",
+            topic_id,
+            str(reason or "").strip() or "未说明",
+        )
+        return "已跳过，本次不会在论坛发帖。请不要输出任何文字。"
+
     @filter.llm_tool(name="discourse_delete_post")
     async def discourse_delete_post(
         self,
