@@ -68,6 +68,9 @@ class DiscourseMessageEvent(AstrMessageEvent):
             return
 
         if self._chat_channel_id:
+            if images and not text:
+                self._adapter.stage_images(f"chat:{self._chat_channel_id}", images)
+                return
             combined = "\n\n".join(part for part in (text, images) if part)
             if await self._adapter.send_to_chat(
                 self._chat_channel_id, combined, remember=bool(text)
@@ -80,8 +83,8 @@ class DiscourseMessageEvent(AstrMessageEvent):
             return
 
         if images and not text:
-            if await self._adapter.send_image_reply(self._topic_id, images):
-                self.set_extra("discourse_tool_replied", True)
+            # 只有图片（如其它插件的表情包）：先暂存，等随下一条文字回复一起发
+            self._adapter.stage_images(f"topic:{self._topic_id}", images)
             return
 
         if self.get_extra("discourse_tool_replied", False):
