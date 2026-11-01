@@ -83,6 +83,7 @@ class StateStore:
             "seen_topics": {},
             "replied_posts": {},
             "blocked_users": {},
+            "chat_seen": {},
         }
 
     def _save(self) -> None:
@@ -180,6 +181,33 @@ class StateStore:
             if str(key).startswith(prefix) and now - _as_ts(ts) < seconds:
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # 聊天（Discourse Chat）已读游标
+    # ------------------------------------------------------------------
+
+    def chat_last_seen(self, channel_id) -> int:
+        bucket = self._bucket("chat_seen")
+        try:
+            return int(bucket.get(str(int(channel_id)) or 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def mark_chat_seen(self, channel_id, message_id: int) -> None:
+        try:
+            key = str(int(channel_id))
+            value = int(message_id or 0)
+        except (TypeError, ValueError):
+            return
+        bucket = self._bucket("chat_seen")
+        try:
+            current = int(bucket.get(key) or 0)
+        except (TypeError, ValueError):
+            current = 0
+        if value <= current:
+            return
+        bucket[key] = value
+        self._save()
 
     # ------------------------------------------------------------------
     # 拉黑名单（不参与三天清理）
