@@ -64,6 +64,7 @@ class DiscourseAPI:
                     headers["User-Api-Client-Id"] = client_id
         if self.host_header:
             base_host = urlparse(self.api_base).netloc
+
             if base_host != self.host_header:
                 headers["Host"] = self.host_header
         return headers
@@ -249,6 +250,12 @@ class DiscourseAPI:
         )
 
     # ---- 聊天（Discourse Chat）----
+
+    async def chat_dm_channels(self, credential: dict) -> dict:
+        """当前账号参与的聊天频道列表（含直接消息）。"""
+        return await self.request(
+            "GET", "/chat/api/me/channels", credential=credential
+        )
 
     async def chat_messages(
         self, credential: dict, channel_id: int, page_size: int = 5
