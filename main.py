@@ -1533,8 +1533,15 @@ class DiscourseForumPlugin(Star):
             return error
         if not self._rate_ok(user_id):
             return "已达到每小时写操作上限，请稍后再试。"
-        if self.store.replied_within(topic_id):
-            return "刚刚已经回复过这个主题，为避免重复发帖，本次不再重复回复。"
+
+        if not post_number and not event.get_extra("discourse_auto_engage"):
+            try:
+                post_number = int(event.get_extra("discourse_post_number") or 0)
+            except (TypeError, ValueError):
+                post_number = 0
+        # 只挡「同一楼层」的重复：同一主题里回复新的楼层是正常行为
+        if self.store.replied_within(topic_id, post_number):
+            return "刚刚已经回复过这一楼，为避免重复发帖，本次不再重复回复。"
 
         if event.get_extra("discourse_auto_engage"):
             replied = list(event.get_extra("discourse_auto_replied") or [])
@@ -1549,12 +1556,6 @@ class DiscourseForumPlugin(Star):
                 raw = f"{prefix}\n\n{raw}"
         mention_suffix, missing_users = await self._resolve_mentions(mentions)
         raw += mention_suffix
-
-        if not post_number and not event.get_extra("discourse_auto_engage"):
-            try:
-                post_number = int(event.get_extra("discourse_post_number") or 0)
-            except (TypeError, ValueError):
-                post_number = 0
 
         payload = {
             "topic_id": int(topic_id),
