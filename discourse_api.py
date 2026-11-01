@@ -333,8 +333,12 @@ class DiscourseAPI:
         form.add_field("synchronous", "true")
         url = f"{self.api_base}/uploads.json"
         headers = self._headers(credential)
+        # 图片上传比普通接口慢得多（大 GIF 可能十几秒），单独放宽超时
+        upload_timeout = aiohttp.ClientTimeout(total=max(120, self.timeout * 4))
         try:
-            async with session.post(url, data=form, headers=headers) as response:
+            async with session.post(
+                url, data=form, headers=headers, timeout=upload_timeout
+            ) as response:
                 payload = None
                 try:
                     payload = await response.json(content_type=None)
@@ -350,7 +354,10 @@ class DiscourseAPI:
         except DiscourseError:
             raise
         except (aiohttp.ClientError, TimeoutError) as exc:
-            raise DiscourseError(None, f"上传失败（网络错误）：{exc}") from exc
+            raise DiscourseError(
+                None,
+                f"上传失败（{type(exc).__name__}）：{exc or '请求超时或连接中断'}",
+            ) from exc
 
     # ---- URL ----
 
