@@ -60,22 +60,21 @@ class DiscourseMessageEvent(AstrMessageEvent):
         if not text and not images:
             return
 
-        if self.get_extra("discourse_skip_reply", False):
-            logger.info(
-                "[DiscourseAdapter] LLM 决定不回复目标 %s，忽略本次文本",
-                self._chat_channel_id or self._topic_id,
-            )
-            return
-
         if self._chat_channel_id:
+            # 聊天频道按普通会话处理：文字原样发出，不检查跳过标记、不做去重
             if images and not text:
                 self._adapter.stage_images(f"chat:{self._chat_channel_id}", images)
                 return
             combined = "\n\n".join(part for part in (text, images) if part)
-            if await self._adapter.send_to_chat(
-                self._chat_channel_id, combined, remember=bool(text)
-            ):
+            if await self._adapter.send_to_chat(self._chat_channel_id, combined):
                 self.set_extra("discourse_tool_replied", True)
+            return
+
+        if self.get_extra("discourse_skip_reply", False):
+            logger.info(
+                "[DiscourseAdapter] LLM 决定不回复主题 %s，忽略本次文本",
+                self._topic_id,
+            )
             return
 
         if not self._topic_id:
