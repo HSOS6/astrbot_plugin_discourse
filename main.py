@@ -14,6 +14,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, StarTools
 
+from .adapter import _plugin_version
 from .discourse_api import DiscourseAPI, DiscourseError, html_to_text
 from .render import (
     format_categories,
@@ -74,7 +75,8 @@ class DiscourseForumPlugin(Star):
         if self._cfg_bool("auto_browse_enabled", True):
             self._auto_task = asyncio.create_task(self._auto_browse_loop())
             logger.info(
-                "[Discourse] 自动逛论坛已启动，间隔 %s 秒",
+                "[Discourse] v%s 自动逛论坛已启动，间隔 %s 秒",
+                _plugin_version() or "?",
                 self._auto_interval(),
             )
 
