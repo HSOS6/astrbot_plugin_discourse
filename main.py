@@ -938,7 +938,7 @@ class DiscourseForumPlugin(Star):
             target_key or "未知目标",
             str(reason or "").strip() or "未说明",
         )
-        return "已跳过，本次不会在论坛发帖。请不要输出任何文字。"
+        return "已跳过，本次不会在论坛发帖。请输出一句简短确认即可，系统会忽略这段文字。"
 
     @filter.llm_tool(name="discourse_delete_post")
     async def discourse_delete_post(
