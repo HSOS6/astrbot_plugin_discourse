@@ -863,37 +863,28 @@ class DiscourseAdapter(Platform):
                 mime = mimetypes.guess_type(name)[0] or "image/png"
                 if not mime.startswith("image/"):
                     continue
-                data = self._shrink_image(data, mime)
                 result = await self.api.upload(self.credential, name, data, mime)
                 url = self.api.absolute_url(str(result.get("url") or ""))
-                parts.append(f"![图片]({url})")
+                # 用 Markdown 的尺寸语法按原尺寸的 50% 显示，不修改原图
+                width, height = self._image_size(data)
+                size = f"|{max(1, width // 2)}x{max(1, height // 2)}" if width and height else ""
+                parts.append(f"![图片{size}]({url})")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[DiscourseAdapter] 图片上传失败：%s", exc)
         return "\n".join(parts)
 
     @staticmethod
-    def _shrink_image(data: bytes, mime: str) -> bytes:
-        """静态图片缩小到 50%；GIF 保留原样，避免动图丢帧。"""
-        if mime == "image/gif":
-            return data
+    def _image_size(data: bytes) -> tuple[int, int]:
+        """读取图片宽高，用于 Markdown 尺寸语法。"""
         try:
             import io
 
             from PIL import Image as PILImage
 
             with PILImage.open(io.BytesIO(data)) as img:
-                width, height = img.size
-                if width <= 0 or height <= 0:
-                    return data
-                resized = img.resize((max(1, width // 2), max(1, height // 2)))
-                out = io.BytesIO()
-                if mime in ("image/jpeg", "image/jpg"):
-                    resized.convert("RGB").save(out, format="JPEG", quality=85)
-                else:
-                    resized.save(out, format="PNG")
-                return out.getvalue()
+                return int(img.width), int(img.height)
         except Exception:  # noqa: BLE001
-            return data
+            return (0, 0)
 
     async def send_image_reply(self, topic_id: int, text: str) -> bool:
         """把图片作为单独一层回帖发到主题。"""
