@@ -867,6 +867,47 @@ class DiscourseForumPlugin(Star):
             mentions=str(mentions or ""),
         )
 
+    @filter.llm_tool(name="discourse_send_chat_message")
+    async def discourse_send_chat_message(
+        self, event: AstrMessageEvent, channel_id: str = "", content: str = ""
+    ) -> str:
+        """在 Discourse 聊天频道（含直接消息）发一条消息。
+
+        Args:
+            channel_id(string): 聊天频道 ID，收到聊天通知时会给出。
+            content(string): 消息正文，纯文本或 Markdown。
+        """
+        credential = self._credential()
+        if not credential:
+            return NO_KEY_HINT
+        try:
+            cid = int(str(channel_id or "").strip())
+        except (TypeError, ValueError):
+            return "无法识别聊天频道 ID，请传入数字。"
+        if cid <= 0:
+            return "无法识别聊天频道 ID，请传入数字。"
+        text = str(content or "").strip()
+        if not text:
+            return "缺少 content 参数。"
+        if "<|" in text:
+            return "消息里混入了模型特殊标记，请重新组织语言后再发。"
+        maximum = max(1, self._cfg_int("max_content_chars", 8000))
+        if len(text) > maximum:
+            return f"消息太长，最多 {maximum} 个字符。"
+        user_id = self._user_id(event)
+        if not self._rate_ok(user_id):
+            return "已达到每小时写操作上限，请稍后再试。"
+        try:
+            await self.api.chat_send(credential, cid, text)
+        except DiscourseError as exc:
+            return f"发送失败：{exc.message}"
+        self._record_write(user_id)
+        event.set_extra("discourse_tool_replied", True)
+        adapter = getattr(event, "adapter", None)
+        if hasattr(adapter, "mark_chat_replied"):
+            adapter.mark_chat_replied(cid)
+        return f"已在聊天频道 {cid} 发送消息。"
+
     @filter.llm_tool(name="discourse_skip_reply")
     async def discourse_skip_reply(self, event: AstrMessageEvent, reason: str = "") -> str:
         """收到论坛通知后决定不回复时调用，避免把思考文字误发成帖子。
@@ -878,13 +919,23 @@ class DiscourseForumPlugin(Star):
             topic_id = int(event.get_extra("discourse_topic_id") or 0)
         except (TypeError, ValueError):
             topic_id = 0
+        try:
+            chat_id = int(event.get_extra("discourse_chat_channel_id") or 0)
+        except (TypeError, ValueError):
+            chat_id = 0
+        if chat_id > 0:
+            target_key = f"chat:{chat_id}"
+        elif topic_id > 0:
+            target_key = f"topic:{topic_id}"
+        else:
+            target_key = ""
         event.set_extra("discourse_skip_reply", True)
         adapter = getattr(event, "adapter", None)
-        if topic_id and hasattr(adapter, "mark_skipped"):
-            adapter.mark_skipped(topic_id)
+        if target_key and hasattr(adapter, "mark_skipped"):
+            adapter.mark_skipped(target_key)
         logger.info(
-            "[Discourse] 跳过回复主题 %s：%s",
-            topic_id or "未知",
+            "[Discourse] 跳过回复 %s：%s",
+            target_key or "未知目标",
             str(reason or "").strip() or "未说明",
         )
         return "已跳过，本次不会在论坛发帖。请不要输出任何文字。"
