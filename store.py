@@ -37,9 +37,18 @@ class StateStore:
         self._dir = Path(data_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._path = self._dir / "state.json"
-        self._data = self._load()
+        self._sig = self._signature()
+        self._data = self._read_disk()
+        self._sig = self._signature()
 
-    def _load(self) -> dict:
+    def _signature(self) -> tuple[float, int]:
+        try:
+            stat = self._path.stat()
+            return (stat.st_mtime, stat.st_size)
+        except OSError:
+            return (0.0, 0)
+
+    def _read_disk(self) -> dict:
         if not self._path.exists():
             return self._defaults()
         try:
@@ -51,6 +60,18 @@ class StateStore:
         data = self._defaults()
         data.update(raw)
         return data
+
+    def _refresh(self) -> None:
+        """state.json 被另一个实例（插件主体/平台适配器）改过时先重新读取。
+
+        插件主体和平台适配器会各建一个 StateStore，指向同一个 state.json。
+        如果只在启动时读一次，两个实例会各自基于过时快照写入，
+        互相覆盖对方的“已回帖子/黑名单”等记录，导致去重时好时坏。
+        """
+        sig = self._signature()
+        if sig != self._sig:
+            self._data = self._read_disk()
+            self._sig = sig
 
     @staticmethod
     def _defaults() -> dict:
@@ -70,11 +91,14 @@ class StateStore:
             json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         os.replace(tmp, self._path)
+        self._sig = self._signature()
 
     def get_state(self) -> dict:
+        self._refresh()
         return dict(self._data)
 
     def set_state(self, **kwargs) -> None:
+        self._refresh()
         self._data.update(kwargs)
         self._save()
 
@@ -83,6 +107,7 @@ class StateStore:
     # ------------------------------------------------------------------
 
     def _bucket(self, key: str) -> dict:
+        self._refresh()
         value = self._data.get(key)
         if not isinstance(value, dict):
             value = {}
@@ -144,7 +169,7 @@ class StateStore:
             return False
         return exact in bucket or whole in bucket
 
-    def replied_within(self, topic_id, seconds: int = 30) -> bool:
+    def replied_within(self, topic_id, seconds: int = 120) -> bool:
         """主题在最近 N 秒内是否刚被回复过（用于阻断一次请求发两条回复）。"""
         try:
             prefix = f"{int(topic_id)}:"
