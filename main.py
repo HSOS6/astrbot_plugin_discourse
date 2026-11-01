@@ -908,9 +908,6 @@ class DiscourseForumPlugin(Star):
             return f"发送失败：{exc.message}"
         self._record_write(user_id)
         event.set_extra("discourse_tool_replied", True)
-        adapter = getattr(event, "adapter", None)
-        if hasattr(adapter, "mark_chat_replied"):
-            adapter.mark_chat_replied(cid)
         return f"已在聊天频道 {cid} 发送消息。"
 
     @filter.llm_tool(name="discourse_skip_reply")
@@ -1301,6 +1298,7 @@ class DiscourseForumPlugin(Star):
         replies.sort(key=lambda item: int(item.get("post_number") or 0))
         if not replies:
             return f"主题 {parsed_id} 第 {floor} 楼暂时没有楼中楼回复。"
+
         lines = [f"主题 {parsed_id} 第 {floor} 楼的回复（{len(replies)} 条）："]
         for post in replies[:limit]:
             text = html_to_text(str(post.get("cooked") or post.get("raw") or "")).strip()
