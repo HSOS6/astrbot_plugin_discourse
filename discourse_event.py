@@ -70,7 +70,7 @@ class DiscourseMessageEvent(AstrMessageEvent):
             return
 
         prefix = str(self.get_extra("discourse_reply_prefix") or "")
-        if prefix and not text.lstrip().startswith("[quote="):
+        if prefix and not text.lstrip().startswith(prefix):
             text = f"{prefix}\n\n{text}"
 
         await self._adapter.reply_to_topic(
