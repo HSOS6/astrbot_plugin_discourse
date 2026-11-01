@@ -3,7 +3,7 @@ display_name: Discourse 论坛助手
 description: "连接 Discourse 论坛：AI 可浏览、阅读、搜索主题，并使用配置的 API Key 发帖、回帖"
 short_desc: 让 AI 看论坛、读帖子、发帖、回帖
 author: 星见雅
-version: "3.1.7"
+version: "3.1.8"
 repo: "https://github.com/HSOS6/astrbot_plugin_discourse"
 support_platforms:
   - aiocqhttp

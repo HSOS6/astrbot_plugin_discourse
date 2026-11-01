@@ -170,17 +170,30 @@ class StateStore:
             return False
         return exact in bucket or whole in bucket
 
-    def replied_within(self, topic_id, seconds: int = 120) -> bool:
-        """主题在最近 N 秒内是否刚被回复过（用于阻断一次请求发两条回复）。"""
+    def replied_within(
+        self, topic_id, post_number: int | None = None, seconds: int = 120
+    ) -> bool:
+        """同一主题（或同一楼层）在最近 N 秒内是否刚被回复过。
+
+        不传 post_number 时按整个主题判断；传了则只判断该楼层，
+        这样同一主题里回复新楼层不会被旧楼层的记录挡住。
+        """
+        bucket = self._bucket("replied_posts")
+        now = time.time()
+        if post_number is None:
+            try:
+                prefix = f"{int(topic_id)}:"
+            except (TypeError, ValueError):
+                return False
+            return any(
+                str(key).startswith(prefix) and now - _as_ts(ts) < seconds
+                for key, ts in bucket.items()
+            )
         try:
-            prefix = f"{int(topic_id)}:"
-            now = time.time()
+            key = f"{int(topic_id)}:{int(post_number or 0)}"
         except (TypeError, ValueError):
             return False
-        for key, ts in self._bucket("replied_posts").items():
-            if str(key).startswith(prefix) and now - _as_ts(ts) < seconds:
-                return True
-        return False
+        return now - _as_ts(bucket.get(key)) < seconds
 
     # ------------------------------------------------------------------
     # 聊天（Discourse Chat）已读游标
