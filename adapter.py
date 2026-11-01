@@ -125,6 +125,8 @@ class DiscourseAdapter(Platform):
     SKIP_WINDOW = 600
     # 聊天通知类型：chat_mention / chat_message / chat_quoted
     CHAT_TYPES = {29, 30, 33}
+    # 其它插件发来的图片，先暂存这么久，等随下一条回复一起发；没等到就单独发
+    IMAGE_HOLD_SECONDS = 15
 
     def __init__(self, config: dict, settings: dict, event_queue: asyncio.Queue):
         super().__init__(config, event_queue)
@@ -180,6 +182,9 @@ class DiscourseAdapter(Platform):
         self._chat_replied_at: dict[int, float] = {}
         # 主题 -> 最近一次发图片时间，用于去重（图片不占用楼层去重记录）
         self._image_sent_at: dict[int, float] = {}
+        # "topic:12" / "chat:3" -> 待随下一条回复一起发送的图片
+        self._pending_images: dict[str, list[str]] = {}
+        self._image_flush_tasks: dict[str, asyncio.Task] = {}
         # 论坛没启用聊天 / 无权访问时停止轮询
         self._chat_poll_disabled = False
         try:
@@ -886,6 +891,46 @@ class DiscourseAdapter(Platform):
         except Exception:  # noqa: BLE001
             return (0, 0)
 
+    def stage_images(self, target_key: str, markdown: str) -> None:
+        """暂存图片，等随下一条文字回复一起发；超时没等到就单独发一层。"""
+        markdown = str(markdown or "").strip()
+        if not markdown:
+            return
+        pending = self._pending_images.setdefault(target_key, [])
+        if markdown in pending:
+            return
+        pending.append(markdown)
+        task = self._image_flush_tasks.get(target_key)
+        if task is None or task.done():
+            self._image_flush_tasks[target_key] = asyncio.create_task(
+                self._flush_images_later(target_key)
+            )
+        logger.info("[DiscourseAdapter] 已暂存图片到 %s，等待随回复发送", target_key)
+
+    def take_pending_images(self, target_key: str) -> str:
+        """取出并清除暂存图片，取消超时单独发送。"""
+        parts = self._pending_images.pop(target_key, [])
+        task = self._image_flush_tasks.pop(target_key, None)
+        if task is not None and not task.done():
+            task.cancel()
+        return "\n\n".join(parts)
+
+    async def _flush_images_later(self, target_key: str) -> None:
+        try:
+            await asyncio.sleep(self.IMAGE_HOLD_SECONDS)
+        except asyncio.CancelledError:
+            return
+        parts = self._pending_images.pop(target_key, [])
+        self._image_flush_tasks.pop(target_key, None)
+        if not parts:
+            return
+        markdown = "\n\n".join(parts)
+        target_id = _as_int(target_key.split(":", 1)[-1])
+        if target_key.startswith("chat:"):
+            await self.send_to_chat(target_id, markdown, remember=False)
+        else:
+            await self.send_image_reply(target_id, markdown)
+
     async def send_image_reply(self, topic_id: int, text: str) -> bool:
         """把图片作为单独一层回帖发到主题。"""
         if not self.token or not text:
@@ -923,6 +968,9 @@ class DiscourseAdapter(Platform):
         channel_id = int(channel_id or 0)
         if channel_id <= 0:
             return False
+        images = self.take_pending_images(f"chat:{channel_id}")
+        if images:
+            text = f"{text}\n\n{images}"
         if "<|" in text:
             logger.warning(
                 "[DiscourseAdapter] 聊天消息含模型特殊标记，丢弃：%s", text[:80]
@@ -985,6 +1033,9 @@ class DiscourseAdapter(Platform):
         topic_id = int(topic_id or 0)
         if topic_id <= 0:
             return False
+        images = self.take_pending_images(f"topic:{topic_id}")
+        if images:
+            text = f"{text}\n\n{images}"
         if self.store is not None and self.store.replied_within(
             topic_id, reply_to_post_number, self.DUPLICATE_WINDOW
         ):
