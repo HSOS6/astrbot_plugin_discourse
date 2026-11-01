@@ -118,7 +118,7 @@ def format_topic(
         lines.append(f"标签：{', '.join(tags)}")
     lines.append(f"链接：{topic_url(site_url, topic_id)}")
     if data.get("created_at"):
-        lines.append(f"创建时间：{time_text(str(data.get('created_at')))})")
+        lines.append(f"创建时间：{time_text(str(data.get('created_at')))}")
     lines.append("")
 
     posts = (data.get("post_stream") or {}).get("posts") or []
