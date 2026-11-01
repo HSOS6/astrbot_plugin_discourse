@@ -85,7 +85,7 @@ CONFIG_METADATA = {
     "reply_mention_user": {
         "description": "回帖时额外 @ 对方",
         "type": "bool",
-        "hint": "引用原楼层始终会带上，这里只控制是否再 @ 用户",
+        "hint": "回复本身已挂在对方楼层下，这里只控制是否再 @ 用户",
     },
 }
 
@@ -105,8 +105,6 @@ class DiscourseAdapter(Platform):
     CONTEXT_FIRST_POST_CHARS = 1200
     CONTEXT_RECENT_POSTS = 3
     CONTEXT_RECENT_POST_CHARS = 400
-    # 自动引用原楼层时最多摘取多少字符；整楼引用会被 Discourse 自动删掉
-    QUOTE_CHARS = 200
     # 同一主题在此时间内只允许发一条回复：模型重试/分段插件会拖到几十秒后才发
     DUPLICATE_WINDOW = 120
     # LLM 决定跳过某条通知后，这段时间内该主题的残留文本一律丢弃
@@ -378,7 +376,7 @@ class DiscourseAdapter(Platform):
         elif notification_type == 15:
             action_text = "在群里提到了你"
 
-        reply_prefix = self._build_reply_prefix(post, topic_id, post_number, username)
+        reply_prefix = self._build_reply_prefix(topic_id, post_number, username)
 
         message_str = (
             f"[论坛通知] @{username} 在主题《{title or '未命名'}》"
@@ -396,7 +394,7 @@ class DiscourseAdapter(Platform):
             f"需要更多楼层请调用 discourse_read_topic(topic_id=\"{topic_id}\")。"
             f"回复时请调用 discourse_publish_reply(topic_id=\"{topic_id}\", content=\"你的回复正文\")，"
             f"topic_id 和 content 两个参数都必须提供。"
-            "系统会自动带上引用（长楼层摘取前 200 字，短楼层由论坛原生回复指向）"
+            "系统会自动把回复挂到对方楼层下"
             + ("并 @ 对方" if self.reply_mention_user else "")
             + "，正文里不要再自己写 [quote] 或重复 @对方。"
             "需要 @ 其他人时，先用 discourse_search_user 确认用户名存在，"
@@ -456,35 +454,17 @@ class DiscourseAdapter(Platform):
             notification_type,
         )
 
-    def _build_reply_prefix(
-        self, post: dict, topic_id, post_number, username: str
-    ) -> str:
-        """构造回复前缀：Discourse 原生引用块（仅长楼层）+ 可选 @ 对方。
+    def _build_reply_prefix(self, topic_id, post_number, username: str) -> str:
+        """构造回复前缀：只保留可选的 @ 对方，不再写引用块。
 
-        Discourse 会自动移除“紧跟在原楼层后面、且引用了整楼原文”的引用块，
-        所以短楼层不写 [quote]，只靠 reply_to_post_number 指向原楼层；
-        长楼层只摘取前 QUOTE_CHARS 个字符加省略号，引用块才能保留下来。
+        Discourse 会自动删掉紧跟在原楼层后的整楼引用，引用块时有时无；
+        回复关系一律交给 reply_to_post_number 由论坛原生显示。
         """
         number = int(post_number or 0)
         tid = int(topic_id or 0)
         if tid <= 0 or number <= 0 or not username:
             return ""
-        quote_text = str(post.get("raw") or "").strip()
-        if not quote_text:
-            quote_text = html_to_text(str(post.get("cooked") or "")).strip()
-        quote_text = quote_text.replace("[/quote]", "").strip()
-        lines: list[str] = []
-        if len(quote_text) > self.QUOTE_CHARS:
-            lines.extend(
-                [
-                    f'[quote="{username}, post:{number}, topic:{tid}"]',
-                    quote_text[: self.QUOTE_CHARS] + "……",
-                    "[/quote]",
-                ]
-            )
-        if self.reply_mention_user:
-            lines.append(f"@{username}")
-        return "\n".join(lines)
+        return f"@{username}" if self.reply_mention_user else ""
 
     async def _topic_context(self, topic_id: int, trigger_post_number: int) -> str:
         """取主楼 + 最近几楼做摘要；条数和字数都有上限，触发通知的那条不重复。"""
@@ -573,7 +553,7 @@ class DiscourseAdapter(Platform):
             self._pending_replies.pop(topic_id, None)
             return
         prefix, post_number = self._pending_replies.pop(topic_id, ("", 0))
-        if prefix and not text.lstrip().startswith("[quote="):
+        if prefix and not text.lstrip().startswith(prefix):
             text = f"{prefix}\n\n{text}"
         await self.reply_to_topic(
             topic_id, text, reply_to_post_number=post_number
