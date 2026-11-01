@@ -7,6 +7,7 @@ import random
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.message_components import Plain
@@ -23,6 +24,18 @@ from astrbot.api.star import StarTools
 from .discourse_api import DiscourseAPI, DiscourseError, html_to_text
 from .discourse_event import DiscourseMessageEvent
 from .store import RETENTION_SECONDS, StateStore
+
+
+def _plugin_version() -> str:
+    """读取 metadata.yaml 的版本号，方便在日志里确认加载的是哪一版。"""
+    try:
+        import yaml
+
+        path = Path(__file__).resolve().parent / "metadata.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return str(data.get("version") or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _parse_iso(value) -> float:
@@ -193,7 +206,8 @@ class DiscourseAdapter(Platform):
             (int(item.get("id") or 0) for item in notifications), default=0
         )
         logger.info(
-            "[DiscourseAdapter] 已启动，基线通知 ID=%s，轮询间隔 %s 秒",
+            "[DiscourseAdapter] v%s 已启动，基线通知 ID=%s，轮询间隔 %s 秒",
+            _plugin_version() or "?",
             self._last_seen_notification_id,
             self.poll_interval,
         )
