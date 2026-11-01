@@ -316,7 +316,17 @@ class DiscourseAdapter(Platform):
                 topic_id,
             )
             return
-        if random.random() > self.reply_probability:
+
+        # 提及 / 引用 / 群组提及：必须回复，不走概率
+        forced_reply = notification_type in (1, 3, 15)
+        # 回复了你的帖子（自己主题或别人主题里的楼层）：交给 LLM 判断要不要回
+        let_llm_decide = notification_type == 2
+
+        if (
+            not forced_reply
+            and not let_llm_decide
+            and random.random() > self.reply_probability
+        ):
             logger.info(
                 "[DiscourseAdapter] 自动回复概率未命中（%.0f%%），跳过通知 %s（@%s -> 主题 %s）",
                 self.reply_probability * 100,
@@ -327,7 +337,11 @@ class DiscourseAdapter(Platform):
             return
 
         title = html_to_text(
-            str(notification.get("fancy_title") or data.get("topic_title") or "")
+            str(
+                notification.get("fancy_title")
+                or data.get("topic_title")
+                or ""
+            )
         ).strip()
         content = html_to_text(str(post.get("cooked") or post.get("raw") or "")).strip()
         if len(content) > 3000:
@@ -368,6 +382,22 @@ class DiscourseAdapter(Platform):
             "再把用户名填进 discourse_publish_reply 的 mentions 参数。"
             "调用了回复工具后就不要再输出额外文字，否则会重复发帖。"
         )
+        if forced_reply:
+            message_str += (
+                "\n\n【对方主动提及或引用了你，必须回复】"
+                "请调用 discourse_publish_reply 回复。"
+                "只有内容明显是骚扰或垃圾信息时，才可以调用 discourse_skip_reply 跳过，"
+                "或先用 discourse_block_user 拉黑对方再跳过。"
+                "不要直接输出文字，直接输出也会被当成回帖。"
+            )
+        elif let_llm_decide:
+            message_str += (
+                "\n\n【对方回复了你的帖子】"
+                "请你自行判断这条回复是否值得回应："
+                "值得就调用 discourse_publish_reply 回复；"
+                "觉得没必要就不用回，调用 discourse_skip_reply 明确跳过。"
+                "注意：直接输出文字也会被当成回帖，所以不回复时只能用 discourse_skip_reply。"
+            )
 
         abm = AstrBotMessage()
         abm.self_id = self.platform_id
@@ -435,7 +465,9 @@ class DiscourseAdapter(Platform):
         try:
             topic = await self.api.topic(topic_id, self.credential)
         except DiscourseError as exc:
-            logger.info("[DiscourseAdapter] 读取主题 %s 上下文失败：%s", topic_id, exc.message)
+            logger.info(
+                "[DiscourseAdapter] 读取主题 %s 上下文失败：%s", topic_id, exc.message
+            )
             return ""
 
         stream_data = topic.get("post_stream") or {}
