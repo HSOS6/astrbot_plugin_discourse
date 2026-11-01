@@ -53,6 +53,12 @@ class DiscourseMessageEvent(AstrMessageEvent):
         if not text:
             return
 
+        if self.get_extra("discourse_skip_reply", False):
+            logger.info(
+                "[DiscourseAdapter] LLM 决定不回复主题 %s，忽略本次文本", self._topic_id
+            )
+            return
+
         if self.get_extra("discourse_tool_replied", False):
             logger.info(
                 "[DiscourseAdapter] 已通过工具回复主题 %s，忽略重复文本回复", self._topic_id
