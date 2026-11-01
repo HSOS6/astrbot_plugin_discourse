@@ -373,7 +373,7 @@ def html_to_text(cooked: str) -> str:
     """把 Discourse 的 cooked HTML 转成适合 LLM 阅读的纯文本。"""
     if not cooked:
         return ""
-    text = re.sub(r"<br\s*/>", "\n", cooked, flags=re.IGNORECASE)
+    text = re.sub(r"<br\s*/?>", "\n", cooked, flags=re.IGNORECASE)
     text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</(?:div|li|h[1-6])>", "\n", text, flags=re.IGNORECASE)
     text = _IMG_RE.sub(lambda m: f"![图片]({m.group(1)})", text)
