@@ -285,7 +285,7 @@ astrbot_plugin_discourse/
 ├── render.py            # 列表 / 主题 / 搜索 / 摘要的文本渲染
 ├── store.py             # 已看已回记录、黑名单、论坛日记的持久化
 ├── _conf_schema.json    # 插件配置项
-└── metadata.yaml        # 插件元信息
+├── metadata.yaml        # 插件元信息
 └── requirements.txt
 ```
 
