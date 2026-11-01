@@ -897,6 +897,11 @@ class DiscourseForumPlugin(Star):
         user_id = self._user_id(event)
         if not self._rate_ok(user_id):
             return "已达到每小时写操作上限，请稍后再试。"
+        adapter = getattr(event, "adapter", None)
+        if hasattr(adapter, "take_pending_images"):
+            images = adapter.take_pending_images(f"chat:{cid}")
+            if images:
+                text = f"{text}\n\n{images}"
         try:
             await self.api.chat_send(credential, cid, text)
         except DiscourseError as exc:
@@ -1554,6 +1559,12 @@ class DiscourseForumPlugin(Star):
         if prefix and not event.get_extra("discourse_auto_engage"):
             if not raw.lstrip().startswith(prefix):
                 raw = f"{prefix}\n\n{raw}"
+        # 其它插件刚发来的图片，随这条文字回复一起发出
+        adapter = getattr(event, "adapter", None)
+        if hasattr(adapter, "take_pending_images"):
+            images = adapter.take_pending_images(f"topic:{int(topic_id)}")
+            if images:
+                raw = f"{raw}\n\n{images}"
         mention_suffix, missing_users = await self._resolve_mentions(mentions)
         raw += mention_suffix
 
