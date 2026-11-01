@@ -248,6 +248,33 @@ class DiscourseAPI:
             credential=credential,
         )
 
+    # ---- 聊天（Discourse Chat）----
+
+    async def chat_messages(
+        self, credential: dict, channel_id: int, page_size: int = 5
+    ) -> dict:
+        """读取聊天频道的最近消息。"""
+        return await self.request(
+            "GET",
+            f"/chat/api/channels/{int(channel_id)}/messages",
+            credential=credential,
+            params={"page_size": max(1, int(page_size))},
+        )
+
+    async def chat_send(
+        self, credential: dict, channel_id: int, text: str, in_reply_to: int = 0
+    ) -> dict:
+        """在聊天频道（含直接消息）发一条消息。"""
+        payload = {"message": str(text or "")}
+        if in_reply_to:
+            payload["in_reply_to_id"] = int(in_reply_to)
+        return await self.request(
+            "POST",
+            f"/chat/{int(channel_id)}",
+            credential=credential,
+            json_data=payload,
+        )
+
     # ---- 写入 ----
 
     async def create_post(self, credential: dict, payload: dict) -> dict:

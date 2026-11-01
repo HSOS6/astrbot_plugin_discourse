@@ -24,7 +24,13 @@ class DiscourseMessageEvent(AstrMessageEvent):
     ) -> None:
         super().__init__(message_str, message_obj, platform_meta, session_id)
         self._adapter = adapter
-        self._topic_id = int(session_id) if str(session_id).isdigit() else 0
+        sid = str(session_id or "")
+        self._topic_id = int(sid) if sid.isdigit() else 0
+        self._chat_channel_id = 0
+        if sid.startswith("chat:"):
+            tail = sid.split(":", 1)[1]
+            if tail.isdigit():
+                self._chat_channel_id = int(tail)
         self._reply_to_post_number = 0
 
     @property
@@ -55,8 +61,14 @@ class DiscourseMessageEvent(AstrMessageEvent):
 
         if self.get_extra("discourse_skip_reply", False):
             logger.info(
-                "[DiscourseAdapter] LLM 决定不回复主题 %s，忽略本次文本", self._topic_id
+                "[DiscourseAdapter] LLM 决定不回复目标 %s，忽略本次文本",
+                self._chat_channel_id or self._topic_id,
             )
+            return
+
+        if self._chat_channel_id:
+            if await self._adapter.send_to_chat(self._chat_channel_id, text):
+                self.set_extra("discourse_tool_replied", True)
             return
 
         if self.get_extra("discourse_tool_replied", False):
