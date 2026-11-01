@@ -109,6 +109,8 @@ class DiscourseAdapter(Platform):
     QUOTE_CHARS = 500
     # 同一主题在此时间内只允许发一条回复，避免工具回复后又被补发一条文本
     DUPLICATE_WINDOW = 30
+    # LLM 决定跳过某条通知后，这段时间内该主题的残留文本一律丢弃
+    SKIP_WINDOW = 600
 
     def __init__(self, config: dict, settings: dict, event_queue: asyncio.Queue):
         super().__init__(config, event_queue)
@@ -156,6 +158,8 @@ class DiscourseAdapter(Platform):
         self._emitted_posts: set[tuple[int, int]] = set()
         # 主题 -> (引用前缀, 楼层号)：供会话纯文本回帖路径复用同一个引用
         self._pending_replies: dict[int, tuple[str, int]] = {}
+        # 主题 -> 跳过时间：LLM 决定不回复后，后续残留文本不再发帖
+        self._skipped_replies: dict[int, float] = {}
         try:
             self.store = StateStore(StarTools.get_data_dir("astrbot_plugin_discourse"))
         except Exception:  # noqa: BLE001
@@ -281,6 +285,9 @@ class DiscourseAdapter(Platform):
                 notification.get("id"),
             )
             return
+
+        # 同一主题来了新通知，解除上一次“决定不回复”的拦截，避免误伤后续回复
+        self._skipped_replies.pop(int(topic_id or 0), None)
 
         username = str(post.get("username") or data.get("display_username") or "未知")
         user_id = post.get("user_id") or data.get("original_user_id") or username
@@ -544,12 +551,33 @@ class DiscourseAdapter(Platform):
                 getattr(session, "session_id", ""),
             )
             return
+        skipped_at = self._skipped_replies.get(topic_id)
+        if skipped_at and time.time() - skipped_at < self.SKIP_WINDOW:
+            logger.info(
+                "[DiscourseAdapter] LLM 已跳过主题 %s 的本次通知，丢弃会话文本",
+                topic_id,
+            )
+            self._pending_replies.pop(topic_id, None)
+            return
         prefix, post_number = self._pending_replies.pop(topic_id, ("", 0))
         if prefix and not text.lstrip().startswith("[quote="):
             text = f"{prefix}\n\n{text}"
         await self.reply_to_topic(
             topic_id, text, reply_to_post_number=post_number
         )
+
+    def mark_skipped(self, topic_id: int) -> None:
+        """记录 LLM 已决定跳过该主题的本次通知。"""
+        topic_id = int(topic_id or 0)
+        if topic_id <= 0:
+            return
+        now = time.time()
+        self._skipped_replies = {
+            tid: stamp
+            for tid, stamp in self._skipped_replies.items()
+            if now - stamp < self.SKIP_WINDOW
+        }
+        self._skipped_replies[topic_id] = now
 
     async def reply_to_topic(
         self, topic_id: int, text: str, reply_to_post_number: int = 0
