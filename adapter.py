@@ -209,8 +209,6 @@ class DiscourseAdapter(Platform):
         self._pending_replies: dict[int, tuple[str, int]] = {}
         # "topic:12" / "chat:3" -> 跳过时间：LLM 决定不回复后，残留文本不再发帖
         self._skipped_targets: dict[str, float] = {}
-        # 聊天频道 -> 最近一次发消息时间，用于去重
-        self._chat_replied_at: dict[int, float] = {}
         # 主题 -> 最近一次发图片时间，用于去重（图片不占用楼层去重记录）
         self._image_sent_at: dict[int, float] = {}
         # "topic:12" / "chat:3" -> 待随下一条回复一起发送的图片
@@ -656,21 +654,11 @@ class DiscourseAdapter(Platform):
         if len(content) > 3000:
             content = content[:3000] + "……"
 
-        channel_name = "直接消息" if is_dm else (channel_title or f"频道 {channel_id}")
-        if notification_type == 30 and not is_dm:
-            action_text = "在聊天频道里发了新消息"
+        if is_dm:
+            message_str = f"@{username}：\n{content}"
         else:
-            action_text = "在私聊里发来消息"
-
+            message_str = f"[频道「{channel_title or channel_id}」] @{username}：\n{content}"
         self._emitted_chat.add((channel_id, message_id))
-
-        message_str = (
-            f"[论坛聊天] @{username} 在{channel_name}里{action_text}：\n\n{content}\n\n"
-            f"要回复请调用 discourse_send_chat_message(channel_id=\"{channel_id}\", "
-            "content=\"你的回复正文\")；不想回复就调用 discourse_skip_reply。"
-            "直接输出文字也会发到聊天；不回复请调用 discourse_skip_reply，"
-            "然后再输出一句短确认，系统会忽略这段文字。"
-        )
 
         abm = AstrBotMessage()
         abm.self_id = self.platform_id
@@ -856,8 +844,7 @@ class DiscourseAdapter(Platform):
                 )
                 return
             combined = "\n\n".join(part for part in (text, images) if part)
-            # 只有图片时不算“主动发言”，避免挡住下一条文字回复
-            await self.send_to_chat(channel_id, combined, remember=bool(text))
+            await self.send_to_chat(channel_id, combined)
             return
         topic_id = self._parse_topic_id(session_id)
         if not topic_id:
@@ -1003,7 +990,7 @@ class DiscourseAdapter(Platform):
         markdown = "\n\n".join(parts)
         target_id = _as_int(target_key.split(":", 1)[-1])
         if target_key.startswith("chat:"):
-            await self.send_to_chat(target_id, markdown, remember=False)
+            await self.send_to_chat(target_id, markdown)
         else:
             await self.send_image_reply(target_id, markdown)
 
@@ -1036,7 +1023,7 @@ class DiscourseAdapter(Platform):
         logger.info("[DiscourseAdapter] 已发送图片到主题 %s", topic_id)
         return True
 
-    async def send_to_chat(self, channel_id: int, text: str, remember: bool = True) -> bool:
+    async def send_to_chat(self, channel_id: int, text: str) -> bool:
         """把文本发到 Discourse 聊天频道（含直接消息）。"""
         if not self.token:
             logger.warning("[DiscourseAdapter] 未配置 token，无法发聊天消息。")
@@ -1052,20 +1039,6 @@ class DiscourseAdapter(Platform):
                 "[DiscourseAdapter] 聊天消息含模型特殊标记，丢弃：%s", text[:80]
             )
             return False
-        skipped_at = self._skipped_targets.get(f"chat:{channel_id}")
-        if skipped_at and time.time() - skipped_at < self.SKIP_WINDOW:
-            logger.info(
-                "[DiscourseAdapter] LLM 已跳过聊天频道 %s 的本次消息，丢弃文本",
-                channel_id,
-            )
-            return False
-        last = self._chat_replied_at.get(channel_id, 0.0)
-        if remember and time.time() - last < self.DUPLICATE_WINDOW:
-            logger.info(
-                "[DiscourseAdapter] 聊天频道 %s 刚刚已经回复过，忽略重复文本",
-                channel_id,
-            )
-            return False
         try:
             await self.api.chat_send(self.credential, channel_id, text)
         except DiscourseError as exc:
@@ -1075,8 +1048,6 @@ class DiscourseAdapter(Platform):
                 exc.message,
             )
             return False
-        if remember:
-            self._chat_replied_at[channel_id] = time.time()
         logger.info("[DiscourseAdapter] 已发送聊天消息到频道 %s", channel_id)
         return True
 
@@ -1092,12 +1063,6 @@ class DiscourseAdapter(Platform):
             if now - stamp < self.SKIP_WINDOW
         }
         self._skipped_targets[key] = now
-
-    def mark_chat_replied(self, channel_id: int) -> None:
-        """记录已经通过工具发过聊天消息，避免纯文本再补发一条。"""
-        channel_id = int(channel_id or 0)
-        if channel_id > 0:
-            self._chat_replied_at[channel_id] = time.time()
 
     async def reply_to_topic(
         self, topic_id: int, text: str, reply_to_post_number: int = 0
