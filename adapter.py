@@ -801,7 +801,7 @@ class DiscourseAdapter(Platform):
 
     async def send_by_session(self, session, message_chain) -> None:
         text = (message_chain.get_plain_text() or "").strip()
-        images = await self._images_markdown(message_chain)
+        images = await self.images_markdown(message_chain)
         if not text and not images:
             return
         if text and "<|" in text:
@@ -850,7 +850,7 @@ class DiscourseAdapter(Platform):
             topic_id, text, reply_to_post_number=post_number
         )
 
-    async def _images_markdown(self, message_chain) -> str:
+    async def images_markdown(self, message_chain) -> str:
         """把消息链里的图片上传到论坛图床，返回 Markdown 图片标记。"""
         parts: list[str] = []
         for comp in getattr(message_chain, "chain", None) or []:
