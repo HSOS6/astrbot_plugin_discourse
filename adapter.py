@@ -24,6 +24,7 @@ from astrbot.api.star import StarTools
 
 from .discourse_api import DiscourseAPI, DiscourseError, html_to_text
 from .discourse_event import DiscourseMessageEvent
+from .imagebed import upload_to_bed
 from .store import RETENTION_SECONDS, StateStore
 
 
@@ -63,6 +64,10 @@ DEFAULT_CONFIG = {
     "reply_probability": 0.1,
     "reply_mention_user": True,
     "notify_title_only": False,
+    "image_host": "auto",
+    "image_host_fallback": True,
+    "smms_token": "",
+    "imgbb_api_key": "",
 }
 
 CONFIG_METADATA = {
@@ -100,6 +105,26 @@ CONFIG_METADATA = {
         "description": "只给 AI 主题标题，由它决定是否查看/回复",
         "type": "bool",
         "hint": "开启后通知只附带标题，AI 需要时自己调用 discourse_read_topic；可显著减少提示词长度",
+    },
+    "image_host": {
+        "description": "图片上传服务",
+        "type": "string",
+        "hint": "auto=按顺序尝试；也可填 catbox / litterbox / uguu / 0x0 / smms / imgbb / discourse",
+    },
+    "image_host_fallback": {
+        "description": "图床失败后自动尝试下一个",
+        "type": "bool",
+        "hint": "关闭后只用第一个图床，失败就不再尝试",
+    },
+    "smms_token": {
+        "description": "sm.ms Token（可选）",
+        "type": "string",
+        "hint": "填了才会把 sm.ms 加入 auto 顺序，格式通常是带 Bearer 前缀的 Token",
+    },
+    "imgbb_api_key": {
+        "description": "imgbb API Key（可选）",
+        "type": "string",
+        "hint": "填了才会把 imgbb 加入 auto 顺序",
     },
 }
 
@@ -149,6 +174,10 @@ class DiscourseAdapter(Platform):
         self.auto_reply = bool(config.get("auto_reply", True))
         self.reply_mention_user = bool(config.get("reply_mention_user", True))
         self.notify_title_only = bool(config.get("notify_title_only", False))
+        self.image_host = str(config.get("image_host") or "auto").strip().lower()
+        self.image_host_fallback = bool(config.get("image_host_fallback", True))
+        self.smms_token = str(config.get("smms_token") or "").strip()
+        self.imgbb_api_key = str(config.get("imgbb_api_key") or "").strip()
         try:
             probability = float(config.get("reply_probability", 0.1))
         except (TypeError, ValueError):
@@ -858,6 +887,45 @@ class DiscourseAdapter(Platform):
             topic_id, text, reply_to_post_number=post_number
         )
 
+    def _image_providers(self) -> list[str]:
+        host = (self.image_host or "auto").lower()
+        if host and host != "auto":
+            return [host]
+        providers: list[str] = []
+        if self.smms_token:
+            providers.append("smms")
+        if self.imgbb_api_key:
+            providers.append("imgbb")
+        providers.extend(["catbox", "uguu", "0x0", "discourse"])
+        return providers
+
+    async def upload_image_bytes(self, filename: str, data: bytes, mime: str) -> str:
+        """按配置顺序上传图片，返回图片地址；全部失败返回空串。"""
+        if not data:
+            return ""
+        for name in self._image_providers():
+            try:
+                if name == "discourse":
+                    result = await self.api.upload(self.credential, filename, data, mime)
+                    url = self.api.absolute_url(str(result.get("url") or ""))
+                else:
+                    url = await upload_to_bed(
+                        name, filename, data, mime, self.smms_token, self.imgbb_api_key
+                    )
+                if url:
+                    logger.info("[DiscourseAdapter] 图片上传成功（%s）：%s", name, url)
+                    return url
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[DiscourseAdapter] 图床 %s 上传失败（%s）：%s",
+                    name,
+                    type(exc).__name__,
+                    getattr(exc, "message", "") or exc,
+                )
+            if not self.image_host_fallback:
+                break
+        return ""
+
     async def images_markdown(self, message_chain) -> str:
         """把消息链里的图片上传到论坛图床，返回 Markdown 图片标记。"""
         parts: list[str] = []
@@ -871,8 +939,9 @@ class DiscourseAdapter(Platform):
                 mime = mimetypes.guess_type(name)[0] or "image/png"
                 if not mime.startswith("image/"):
                     continue
-                result = await self.api.upload(self.credential, name, data, mime)
-                url = self.api.absolute_url(str(result.get("url") or ""))
+                url = await self.upload_image_bytes(name, data, mime)
+                if not url:
+                    continue
                 # 用 Markdown 的尺寸语法按原尺寸的 50% 显示，不修改原图
                 width, height = self._image_size(data)
                 size = f"|{max(1, width // 2)}x{max(1, height // 2)}" if width and height else ""
