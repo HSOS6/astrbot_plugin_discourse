@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from urllib.parse import urlparse
 
@@ -185,6 +186,56 @@ class DiscourseAPI:
         return await self.request(
             "PUT", "/notifications/mark-read.json", credential=credential
         )
+
+    async def message_bus_poll(
+        self,
+        credential: dict,
+        client_id: str,
+        channels: dict[str, int],
+        seq: int,
+        long_poll: bool = True,
+        timeout: int = 45,
+    ) -> list[dict]:
+        """MessageBus 订阅接口：Discourse 网页端就是靠它实时收通知和聊天。
+
+        表单里每个键都是频道名，值是该频道本地最后收到的 message_id；
+        返回结果里的 message_id 用于下次续订，所以不会重放旧消息。
+        """
+        session = await self._get_session()
+        form = aiohttp.FormData()
+        for channel, position in channels.items():
+            form.add_field(channel, str(int(position)))
+        form.add_field("__seq", str(int(seq)))
+        headers = self._headers(credential)
+        headers["Dont-Chunk"] = "true"
+        headers["X-SILENCE-LOGGER"] = "true"
+        url = f"{self.api_base}/message-bus/{client_id}/poll"
+        if not long_poll:
+            url += "?dlp=t"
+        try:
+            async with session.post(
+                url,
+                data=form,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=max(10, int(timeout))),
+            ) as response:
+                text = await response.text()
+                try:
+                    payload = json.loads(text) if text else []
+                except ValueError:
+                    payload = None
+                if response.status < 200 or response.status >= 300:
+                    raise DiscourseError(
+                        response.status,
+                        _error_message(response.status, payload),
+                        payload,
+                        _retry_after(response.status, response.headers, payload),
+                    )
+                return payload if isinstance(payload, list) else []
+        except DiscourseError:
+            raise
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise DiscourseError(None, f"MessageBus 连接中断：{exc}") from exc
 
     async def post(self, post_id: int, credential: dict | None = None) -> dict:
         return await self.request(
