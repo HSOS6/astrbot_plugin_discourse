@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import mimetypes
 import random
 import re
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -82,9 +84,9 @@ CONFIG_METADATA = {
         "hint": "论坛 偏好设置 → API key 面板生成的 Key",
     },
     "poll_interval": {
-        "description": "轮询间隔（秒）",
+        "description": "兜底轮询间隔（秒）",
         "type": "int",
-        "hint": "检查论坛 @提及 / 回复的间隔，最小 15 秒",
+        "hint": "正常时由 MessageBus 实时推送；这里只控制降级/补齐时的检查间隔，最小 15 秒",
     },
     "auto_reply": {
         "description": "收到通知后自动唤醒 AI 回复",
@@ -150,8 +152,13 @@ class DiscourseAdapter(Platform):
     SKIP_WINDOW = 600
     # 聊天通知类型：chat_mention / chat_message / chat_quoted
     CHAT_TYPES = {29, 30, 33}
-    # 429 退避 + 聊天频道降频轮询
-    BUILD_TAG = "2026-11-02-rate-limit"
+    # MessageBus 长轮询：和论坛网页端一样由服务端推送，不再定时拉取
+    BUILD_TAG = "2026-11-02-messagebus"
+    BUS_LONG_POLL_SECONDS = 25
+    # 一次长连接结束后留一点空隙再续订，既能近实时又不会打满每日配额
+    BUS_GAP_SECONDS = 5
+    CHANNEL_REFRESH_SECONDS = 600
+    NOTIFICATION_SYNC_SECONDS = 600
     # 其它插件发来的图片，先暂存这么久，等随下一条回复一起发；没等到就单独发
     IMAGE_HOLD_SECONDS = 15
 
@@ -203,6 +210,7 @@ class DiscourseAdapter(Platform):
         )
         self._last_seen_notification_id = 0
         self._self_username = ""
+        self._self_user_id = 0
         self._emitted_posts: set[tuple[int, int]] = set()
         self._emitted_chat: set[tuple[int, int]] = set()
         # 主题 -> (引用前缀, 楼层号)：供会话纯文本回帖路径复用同一个引用
@@ -220,6 +228,18 @@ class DiscourseAdapter(Platform):
         self._rate_limited_until = 0.0
         # 聊天频道单独降频轮询，避免和通知一起把请求数打满
         self._next_chat_poll = 0.0
+        # MessageBus 长轮询状态：客户端 ID、序号、各频道已收到的 message_id
+        self._bus_client_id = uuid.uuid4().hex
+        self._bus_seq = 0
+        self._bus_positions: dict[str, int] = {}
+        # 聊天频道缓存：频道 ID -> 标题 / 是否直接消息
+        self._chat_channels: dict[int, dict] = {}
+        self._next_channel_refresh = 0.0
+        self._next_notification_sync = 0.0
+        # MessageBus 连续失败次数与下次重试时间；认证失败则永久退回 REST
+        self._bus_failures = 0
+        self._bus_retry_at = 0.0
+        self._bus_disabled = False
         try:
             self.store = StateStore(StarTools.get_data_dir("astrbot_plugin_discourse"))
         except Exception:  # noqa: BLE001
@@ -251,10 +271,102 @@ class DiscourseAdapter(Platform):
         try:
             user = await self.api.current_user(self.credential)
             self._self_username = str(user.get("username") or "")
+            self._self_user_id = _as_int(user.get("id"))
         except DiscourseError as exc:
             logger.warning("[DiscourseAdapter] 读取论坛身份失败：%s", exc.message)
 
         # 首次运行只记录基线，不处理历史通知
+        await self._fetch_notification_baseline()
+        self._next_notification_sync = time.time() + self.NOTIFICATION_SYNC_SECONDS
+
+        await self._refresh_chat_channels(force=True)
+        if self._self_user_id:
+            try:
+                await self._sync_bus_positions()
+            except DiscourseError as exc:
+                self._note_rate_limit(exc)
+                logger.warning(
+                    "[DiscourseAdapter] 读取 MessageBus 频道位置失败：%s", exc.message
+                )
+
+        logger.info(
+            "[DiscourseAdapter] v%s（build %s）已启动，基线通知 ID=%s，%s，%s 个聊天频道，兜底轮询间隔 %s 秒",
+            _plugin_version() or "?",
+            self.BUILD_TAG,
+            self._last_seen_notification_id,
+            f"MessageBus 长轮询（/notification/{self._self_user_id}）"
+            if self._self_user_id
+            else "未取得用户 ID，只能 REST 轮询",
+            len(self._chat_channels),
+            max(60, self.poll_interval),
+        )
+
+        while not self._stopped:
+            if not self._self_user_id or self._bus_disabled:
+                await self._poll_rest_once()
+                await asyncio.sleep(max(60, self.poll_interval))
+                continue
+
+            now = time.time()
+            if now < self._rate_limited_until:
+                # 论坛限流中：按 Retry-After 等待，别继续加重负担
+                wait = min(self._rate_limited_until - now, 300)
+                logger.info("[DiscourseAdapter] 论坛仍在限流，%.0f 秒后恢复", wait)
+                await asyncio.sleep(wait)
+                continue
+            if now < self._bus_retry_at:
+                # MessageBus 暂时失败：用 REST 慢速兜底，别把请求数打满
+                await self._poll_rest_once()
+                await asyncio.sleep(max(60, self.poll_interval))
+                continue
+
+            try:
+                received = await self._bus_poll_once()
+                self._bus_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except DiscourseError as exc:
+                self._note_rate_limit(exc)
+                self._bus_failures += 1
+                delay = min(300, 5 * (2 ** min(self._bus_failures, 6)))
+                self._bus_retry_at = time.time() + delay
+                if exc.status in (401, 403):
+                    self._bus_disabled = True
+                    logger.warning(
+                        "[DiscourseAdapter] MessageBus 认证失败（%s），改为 REST 轮询；"
+                        "请检查论坛 Key 是否有效",
+                        exc.status,
+                    )
+                else:
+                    logger.warning(
+                        "[DiscourseAdapter] MessageBus 订阅失败：%s；%.0f 秒后用 REST 兜底",
+                        exc.message,
+                        delay,
+                    )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                self._bus_failures += 1
+                delay = min(300, 5 * (2 ** min(self._bus_failures, 6)))
+                self._bus_retry_at = time.time() + delay
+                logger.warning(
+                    "[DiscourseAdapter] MessageBus 处理异常（%s）：%s；%.0f 秒后重试",
+                    type(exc).__name__,
+                    exc,
+                    delay,
+                )
+                continue
+
+            if received:
+                # 有消息就立刻再订阅，连发消息不用等下一个间隔
+                continue
+            # 长连接已经挂了 25 秒，稍作停顿就续订：消息延迟与 poll_interval 无关
+            await asyncio.sleep(self.BUS_GAP_SECONDS)
+
+        await self.api.close()
+
+    async def _fetch_notification_baseline(self) -> None:
+        """首次运行只记录已读基线，不处理历史通知。"""
+        data: dict = {}
         while not self._stopped:
             try:
                 data = await self.api.notifications(self.credential, limit=20)
@@ -267,67 +379,253 @@ class DiscourseAdapter(Platform):
                 wait = max(self.poll_interval, self._rate_limited_until - time.time())
                 await asyncio.sleep(wait)
 
-        notifications = (data.get("notifications") or []) if "data" in locals() else []
+        notifications = data.get("notifications") or []
         self._last_seen_notification_id = max(
             (int(item.get("id") or 0) for item in notifications), default=0
         )
-        logger.info(
-            "[DiscourseAdapter] v%s（build %s）已启动，基线通知 ID=%s，轮询间隔 %s 秒",
-            _plugin_version() or "?",
-            self.BUILD_TAG,
-            self._last_seen_notification_id,
-            self.poll_interval,
+
+    async def _poll_rest_once(self) -> None:
+        """MessageBus 不可用时的兜底：慢速拉取通知与聊天直接消息。"""
+        if self.store is not None:
+            self.store.prune()
+        await self._sync_notifications()
+        try:
+            await self._poll_chat_dms()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DiscourseAdapter] 轮询聊天频道失败：%s", exc)
+
+    async def _sync_notifications(self) -> None:
+        """拉取一次通知列表，处理其中尚未见过的通知。"""
+        try:
+            data = await self.api.notifications(self.credential, limit=20)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DiscourseAdapter] 同步通知失败：%s", exc)
+            self._note_rate_limit(exc)
+            return
+
+        notifications = data.get("notifications") or []
+        new_items = [
+            item
+            for item in notifications
+            if int(item.get("id") or 0) > self._last_seen_notification_id
+        ]
+        new_items.sort(key=lambda item: int(item.get("id") or 0))
+
+        for item in new_items:
+            try:
+                await self._emit_notification(item)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[DiscourseAdapter] 处理通知失败：%s", exc)
+                self._note_rate_limit(exc)
+            self._last_seen_notification_id = max(
+                self._last_seen_notification_id, int(item.get("id") or 0)
+            )
+
+    async def _refresh_chat_channels(self, force: bool = False) -> None:
+        """读取当前账号参与的聊天频道，长轮询时按频道订阅。"""
+        now = time.time()
+        if self._chat_poll_disabled and not force:
+            return
+        if not force and now < self._next_channel_refresh:
+            return
+        self._next_channel_refresh = now + self.CHANNEL_REFRESH_SECONDS
+        self._chat_poll_disabled = False
+        try:
+            payload = await self.api.chat_dm_channels(self.credential)
+        except DiscourseError as exc:
+            if exc.status in (403, 404):
+                self._chat_poll_disabled = True
+                logger.info(
+                    "[DiscourseAdapter] 论坛未启用聊天或无权访问，停止订阅聊天频道：%s",
+                    exc.message,
+                )
+            else:
+                logger.info("[DiscourseAdapter] 读取聊天频道列表失败：%s", exc.message)
+                self._note_rate_limit(exc)
+            return
+
+        channels: dict[int, dict] = {}
+        for key, is_dm in (
+            ("public_channels", False),
+            ("direct_message_channels", True),
+        ):
+            for item in payload.get(key) or []:
+                channel_id = _as_int(item.get("id"))
+                if channel_id <= 0:
+                    continue
+                channels[channel_id] = {
+                    "title": str(item.get("title") or "").strip(),
+                    "is_dm": is_dm,
+                }
+        self._chat_channels = channels
+
+    def _bus_channels(self) -> dict[str, int]:
+        """当前要订阅的 MessageBus 频道及本地最后位置。"""
+        channels: dict[str, int] = {}
+        if self._self_user_id:
+            name = f"/notification/{self._self_user_id}"
+            channels[name] = self._bus_positions.get(name, -1)
+        for channel_id in self._chat_channels:
+            name = f"/chat/{channel_id}"
+            channels[name] = self._bus_positions.get(name, -1)
+        name = "/chat/new-channel"
+        channels[name] = self._bus_positions.get(name, -1)
+        return channels
+
+    async def _sync_bus_positions(self) -> None:
+        """用 /__status 给尚未订阅的频道取最新 message_id，避免重放积压。
+
+        已经有位置的频道沿用本地位置，所以不会跳过刚发布的消息；
+        只有本次新增的频道才会用 10**9 占位并从 /__status 拿到真实基线。
+        """
+        body: dict[str, int] = {}
+        for name, position in self._bus_channels().items():
+            body[name] = 10**9 if position < 0 else position
+        body["/__status"] = -1
+        self._bus_seq += 1
+        messages = await self.api.message_bus_poll(
+            self.credential,
+            self._bus_client_id,
+            body,
+            self._bus_seq,
+            long_poll=False,
+            timeout=15,
+        )
+        for item in messages:
+            channel = str(item.get("channel") or "")
+            if channel == "/__status":
+                data = item.get("data")
+                if not isinstance(data, dict):
+                    continue
+                for name in self._bus_channels():
+                    if name in self._bus_positions:
+                        continue
+                    self._bus_positions[name] = max(0, _as_int(data.get(name)))
+                continue
+            # 对账期间新发布的消息也要处理，别丢
+            await self._handle_bus_message(item)
+
+    async def _bus_poll_once(self) -> bool:
+        """做一次 MessageBus 长轮询并处理推送，返回是否收到了消息。"""
+        now = time.time()
+        if now >= self._next_channel_refresh:
+            await self._refresh_chat_channels()
+            if any(pos < 0 for pos in self._bus_channels().values()):
+                await self._sync_bus_positions()
+        if now >= self._next_notification_sync:
+            # 长轮询偶发丢消息：低频对账一次，补齐通知缺口
+            self._next_notification_sync = now + self.NOTIFICATION_SYNC_SECONDS
+            await self._sync_notifications()
+
+        self._bus_seq += 1
+        messages = await self.api.message_bus_poll(
+            self.credential,
+            self._bus_client_id,
+            self._bus_channels(),
+            self._bus_seq,
+            long_poll=True,
+            timeout=max(30, self.BUS_LONG_POLL_SECONDS + 15),
+        )
+        for item in messages:
+            await self._handle_bus_message(item)
+        return bool(messages)
+
+    async def _handle_bus_message(self, item: dict) -> None:
+        channel = str(item.get("channel") or "")
+        message_id = _as_int(item.get("message_id"))
+        if message_id > 0:
+            self._bus_positions[channel] = message_id
+        data = item.get("data")
+        if channel.startswith("/notification/"):
+            await self._handle_bus_notification(data)
+        elif channel == "/chat/new-channel":
+            # 出现新频道：下一轮先刷新频道清单，再给新频道单独定基线
+            self._next_channel_refresh = 0.0
+        elif channel.startswith("/chat/"):
+            await self._handle_bus_chat(channel, data)
+
+    async def _handle_bus_notification(self, data) -> None:
+        """通知频道推送里直接带最后一条通知，省掉一次 /notifications.json。"""
+        payload = data
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                return
+        if not isinstance(payload, dict):
+            return
+
+        last = payload.get("last_notification")
+        if not isinstance(last, dict):
+            # 推送内容不含通知体时退回拉列表
+            await self._sync_notifications()
+            return
+
+        notification_id = _as_int(last.get("id"))
+        if notification_id <= self._last_seen_notification_id:
+            return
+        if notification_id - self._last_seen_notification_id > 1:
+            # 中间漏了通知（推送只给最新一条），补拉一次列表
+            await self._sync_notifications()
+            return
+
+        try:
+            await self._emit_notification(last)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DiscourseAdapter] 处理通知失败：%s", exc)
+            self._note_rate_limit(exc)
+        self._last_seen_notification_id = max(
+            self._last_seen_notification_id, notification_id
         )
 
-        while not self._stopped:
-            await asyncio.sleep(self.poll_interval)
-            now = time.time()
-            if now < self._rate_limited_until:
-                # 论坛限流中：按 Retry-After 等待，别继续加重负担
-                logger.info(
-                    "[DiscourseAdapter] 论坛仍在限流，%.0f 秒后恢复轮询",
-                    self._rate_limited_until - now,
-                )
-                await asyncio.sleep(min(self._rate_limited_until - now, 300))
-                continue
-            if self.store is not None:
-                self.store.prune()
+    async def _handle_bus_chat(self, channel_name: str, data) -> None:
+        """聊天频道推送：消息体已完整，不再逐频道拉 messages。"""
+        payload = data
+        if isinstance(payload, str):
             try:
-                data = await self.api.notifications(self.credential, limit=20)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[DiscourseAdapter] 轮询通知失败：%s", exc)
-                self._note_rate_limit(exc)
+                payload = json.loads(payload)
+            except ValueError:
+                return
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("type") or "") not in ("sent", "processed"):
+            # reaction / edit / delete 等事件不需要转成消息
+            return
+
+        message = payload.get("chat_message") or payload.get("message")
+        if not isinstance(message, dict):
+            return
+        channel_id = _as_int(
+            payload.get("channel_id")
+            or message.get("chat_channel_id")
+            or channel_name.rsplit("/", 1)[-1]
+        )
+        meta = self._chat_channels.get(channel_id) or {}
+        # 公共频道只有被 @ / 引用才唤醒；其余消息按群聊普通消息投递
+        notification_type = 29 if self._is_self_mentioned(message) else 30
+        self._dispatch_chat_message(
+            channel_id=channel_id,
+            message=message,
+            channel_title=str(meta.get("title") or "").strip(),
+            is_dm=bool(meta.get("is_dm")),
+            notification_type=notification_type,
+            source_id=f"bus-{_as_int(message.get('id'))}",
+        )
+
+    def _is_self_mentioned(self, message: dict) -> bool:
+        for user in message.get("mentioned_users") or []:
+            if not isinstance(user, dict):
                 continue
-
-            notifications = data.get("notifications") or []
-            new_items = [
-                item
-                for item in notifications
-                if int(item.get("id") or 0) > self._last_seen_notification_id
-            ]
-            new_items.sort(key=lambda item: int(item.get("id") or 0))
-
-            for item in new_items:
-                try:
-                    await self._emit_notification(item)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[DiscourseAdapter] 处理通知失败：%s", exc)
-                    self._note_rate_limit(exc)
-                self._last_seen_notification_id = max(
-                    self._last_seen_notification_id, int(item.get("id") or 0)
-                )
-
-            # 聊天直接消息不一定产生通知，额外轮询一次频道做兜底
-            try:
-                await self._poll_chat_dms()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[DiscourseAdapter] 轮询聊天频道失败：%s", exc)
-
-        await self.api.close()
+            if self._self_user_id and _as_int(user.get("id")) == self._self_user_id:
+                return True
+            username = str(user.get("username") or "")
+            if self._self_username and username == self._self_username:
+                return True
+        return False
 
     async def _emit_notification(self, notification: dict):
         notification_type = int(notification.get("notification_type") or 0)
