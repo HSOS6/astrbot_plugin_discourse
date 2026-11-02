@@ -15,13 +15,23 @@ USER_AGENT = "AstrBot-Discourse-Forum/1.0"
 
 
 class DiscourseError(Exception):
-    """Discourse 请求失败。status 为 None 表示网络层错误。"""
+    """Discourse 请求失败。status 为 None 表示网络层错误。
 
-    def __init__(self, status: int | None, message: str, payload=None):
+    retry_after：429 时论坛建议的等待秒数，用于退避轮询。
+    """
+
+    def __init__(
+        self,
+        status: int | None,
+        message: str,
+        payload=None,
+        retry_after: float = 0.0,
+    ):
         super().__init__(message)
         self.status = status
         self.message = message
         self.payload = payload
+        self.retry_after = retry_after
 
 
 class DiscourseAPI:
@@ -97,6 +107,7 @@ class DiscourseAPI:
                         response.status,
                         _error_message(response.status, payload),
                         payload,
+                        _retry_after(response.status, response.headers, payload),
                     )
                 return payload if isinstance(payload, dict) else {"data": payload}
         except DiscourseError:
@@ -349,6 +360,7 @@ class DiscourseAPI:
                         response.status,
                         _error_message(response.status, payload),
                         payload,
+                        _retry_after(response.status, response.headers, payload),
                     )
                 return payload if isinstance(payload, dict) else {"data": payload}
         except DiscourseError:
@@ -370,6 +382,30 @@ class DiscourseAPI:
 
     def topic_url(self, topic_id: int) -> str:
         return f"{self.site_url}/t/{int(topic_id)}"
+
+
+def _to_seconds(value) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return seconds if seconds > 0 else 0.0
+
+
+def _retry_after(status: int, headers, payload) -> float:
+    """429 的等待秒数：优先 Retry-After 头，其次响应体里的 retry_after。"""
+    if status != 429:
+        return 0.0
+    seconds = _to_seconds(headers.get("Retry-After") if headers else None)
+    if seconds > 0:
+        return seconds
+    if isinstance(payload, dict):
+        candidate = payload.get("retry_after")
+        extras = payload.get("extras")
+        if isinstance(extras, dict):
+            candidate = candidate or extras.get("retry_after")
+        seconds = _to_seconds(candidate)
+    return seconds
 
 
 def _error_message(status: int, payload) -> str:
