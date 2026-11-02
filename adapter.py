@@ -150,8 +150,8 @@ class DiscourseAdapter(Platform):
     SKIP_WINDOW = 600
     # 聊天通知类型：chat_mention / chat_message / chat_quoted
     CHAT_TYPES = {29, 30, 33}
-    # 聊天消息原文直通，公共频道按群聊唤醒
-    BUILD_TAG = "2026-11-02-groupchat"
+    # 429 退避 + 聊天频道降频轮询
+    BUILD_TAG = "2026-11-02-rate-limit"
     # 其它插件发来的图片，先暂存这么久，等随下一条回复一起发；没等到就单独发
     IMAGE_HOLD_SECONDS = 15
 
@@ -216,6 +216,10 @@ class DiscourseAdapter(Platform):
         self._image_flush_tasks: dict[str, asyncio.Task] = {}
         # 论坛没启用聊天 / 无权访问时停止轮询
         self._chat_poll_disabled = False
+        # 被论坛限流（429）时暂停轮询到该时间点
+        self._rate_limited_until = 0.0
+        # 聊天频道单独降频轮询，避免和通知一起把请求数打满
+        self._next_chat_poll = 0.0
         try:
             self.store = StateStore(StarTools.get_data_dir("astrbot_plugin_discourse"))
         except Exception:  # noqa: BLE001
@@ -259,7 +263,9 @@ class DiscourseAdapter(Platform):
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[DiscourseAdapter] 读取通知失败：%s", exc)
-                await asyncio.sleep(self.poll_interval)
+                self._note_rate_limit(exc)
+                wait = max(self.poll_interval, self._rate_limited_until - time.time())
+                await asyncio.sleep(wait)
 
         notifications = (data.get("notifications") or []) if "data" in locals() else []
         self._last_seen_notification_id = max(
@@ -275,6 +281,15 @@ class DiscourseAdapter(Platform):
 
         while not self._stopped:
             await asyncio.sleep(self.poll_interval)
+            now = time.time()
+            if now < self._rate_limited_until:
+                # 论坛限流中：按 Retry-After 等待，别继续加重负担
+                logger.info(
+                    "[DiscourseAdapter] 论坛仍在限流，%.0f 秒后恢复轮询",
+                    self._rate_limited_until - now,
+                )
+                await asyncio.sleep(min(self._rate_limited_until - now, 300))
+                continue
             if self.store is not None:
                 self.store.prune()
             try:
@@ -283,6 +298,7 @@ class DiscourseAdapter(Platform):
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[DiscourseAdapter] 轮询通知失败：%s", exc)
+                self._note_rate_limit(exc)
                 continue
 
             notifications = data.get("notifications") or []
@@ -298,6 +314,7 @@ class DiscourseAdapter(Platform):
                     await self._emit_notification(item)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[DiscourseAdapter] 处理通知失败：%s", exc)
+                    self._note_rate_limit(exc)
                 self._last_seen_notification_id = max(
                     self._last_seen_notification_id, int(item.get("id") or 0)
                 )
@@ -694,10 +711,29 @@ class DiscourseAdapter(Platform):
             notification_type,
         )
 
+    def _note_rate_limit(self, exc: Exception) -> None:
+        """429 时按论坛给的 Retry-After 暂停轮询，退避期间不再发请求。"""
+        if getattr(exc, "status", None) != 429:
+            return
+        try:
+            seconds = float(getattr(exc, "retry_after", 0) or 0)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        delay = max(30.0, seconds)
+        self._rate_limited_until = max(self._rate_limited_until, time.time() + delay)
+        logger.warning(
+            "[DiscourseAdapter] 触发论坛限流，暂停轮询 %.0f 秒", delay
+        )
+
     async def _poll_chat_dms(self) -> None:
         """兜底轮询直接消息频道：论坛不产生聊天通知时也能收到私聊。"""
         if self._chat_poll_disabled or self.store is None:
             return
+        now = time.time()
+        if now < self._rate_limited_until or now < self._next_chat_poll:
+            return
+        # 聊天频道轮询只是兜底，单独降频，别和通知轮询一起触发限流
+        self._next_chat_poll = now + max(60, self.poll_interval * 2)
         try:
             payload = await self.api.chat_dm_channels(self.credential)
         except DiscourseError as exc:
@@ -709,6 +745,7 @@ class DiscourseAdapter(Platform):
                 )
             else:
                 logger.info("[DiscourseAdapter] 读取聊天频道列表失败：%s", exc.message)
+                self._note_rate_limit(exc)
             return
 
         for channel in payload.get("direct_message_channels") or []:
@@ -723,6 +760,9 @@ class DiscourseAdapter(Platform):
                     channel_id,
                     exc.message,
                 )
+                if exc.status == 429:
+                    self._note_rate_limit(exc)
+                    return
                 continue
             messages = data.get("messages") or []
             if not messages:
