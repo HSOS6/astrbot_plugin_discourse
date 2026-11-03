@@ -62,9 +62,6 @@ class DiscourseMessageEvent(AstrMessageEvent):
 
         if self._chat_channel_id:
             # 聊天频道按普通会话处理：文字原样发出，不检查跳过标记、不做去重
-            if images and not text:
-                self._adapter.stage_images(f"chat:{self._chat_channel_id}", images)
-                return
             combined = "\n\n".join(part for part in (text, images) if part)
             if await self._adapter.send_to_chat(self._chat_channel_id, combined):
                 self.set_extra("discourse_tool_replied", True)
@@ -87,6 +84,9 @@ class DiscourseMessageEvent(AstrMessageEvent):
             return
 
         if self.get_extra("discourse_tool_replied", False):
+            if images:
+                # 工具已经发过回复：图片暂存后补进那层回复，不再另开一层
+                self._adapter.stage_images(f"topic:{self._topic_id}", images)
             logger.info(
                 "[DiscourseAdapter] 已通过工具回复主题 %s，忽略重复文本回复", self._topic_id
             )

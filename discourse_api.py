@@ -349,6 +349,15 @@ class DiscourseAPI:
             "POST", "/posts.json", credential=credential, json_data=payload
         )
 
+    async def update_post(self, credential: dict, post_id: int, raw: str) -> dict:
+        """编辑自己的帖子（用于把迟到图片补进同一层回复）。"""
+        return await self.request(
+            "PUT",
+            f"/posts/{int(post_id)}.json",
+            credential=credential,
+            json_data={"post": {"raw": raw}},
+        )
+
     async def delete_post(self, credential: dict, post_id: int) -> dict:
         return await self.request(
             "DELETE", f"/posts/{int(post_id)}.json", credential=credential

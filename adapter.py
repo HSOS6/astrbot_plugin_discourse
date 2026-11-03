@@ -10,10 +10,11 @@ import re
 import time
 import uuid
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 
 from astrbot.api import logger
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.platform import (
     AstrBotMessage,
     MessageMember,
@@ -57,6 +58,26 @@ def _parse_iso(value) -> float:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return 0.0
+
+
+def dedupe_mentions(text: str) -> str:
+    """同一个用户名只保留第一次 @，避免引用前缀和模型输出各 @ 一遍。"""
+    if not text or "@" not in text:
+        return text
+    seen: set[str] = set()
+
+    def replace(match: re.Match) -> str:
+        name = match.group(1).lower()
+        if name in seen:
+            return ""
+        seen.add(name)
+        return match.group(0)
+
+    cleaned = re.sub(r"@([A-Za-z0-9_.-]{1,60})", replace, text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
 
 DEFAULT_CONFIG = {
     "site_url": "https://xinjianya.top",
@@ -153,16 +174,21 @@ class DiscourseAdapter(Platform):
     # 聊天通知类型：chat_mention / chat_message / chat_quoted
     CHAT_TYPES = {29, 30, 33}
     # MessageBus 长轮询：和论坛网页端一样由服务端推送，不再定时拉取
-    BUILD_TAG = "2026-11-03-rate-limit"
+    BUILD_TAG = "2026-11-03-realtime-fix"
     BUS_LONG_POLL_SECONDS = 25
     # 一次长连接结束后留一点空隙再续订，既能近实时又不会打满每日配额
     BUS_GAP_SECONDS = 5
     CHANNEL_REFRESH_SECONDS = 600
-    NOTIFICATION_SYNC_SECONDS = 600
+    NOTIFICATION_SYNC_SECONDS = 180
     # 连续 429 时的最长退避：额度用完就歇着，别反复试探
     RATE_LIMIT_MAX_BACKOFF = 1800
     # 其它插件发来的图片，先暂存这么久，等随下一条回复一起发；没等到就单独发
     IMAGE_HOLD_SECONDS = 15
+    # 回复发出后这么久内又来了图片，直接补进那层回复，而不是另开一层
+    IMAGE_MERGE_WINDOW = 300
+    # 聊天消息里的图片：cooked 是 <img src>，message 是 ![说明](url)
+    CHAT_IMG_TAG_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+    CHAT_IMG_MD_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
     def __init__(self, config: dict, settings: dict, event_queue: asyncio.Queue):
         super().__init__(config, event_queue)
@@ -221,6 +247,8 @@ class DiscourseAdapter(Platform):
         self._skipped_targets: dict[str, float] = {}
         # 主题 -> 最近一次发图片时间，用于去重（图片不占用楼层去重记录）
         self._image_sent_at: dict[int, float] = {}
+        # 主题 -> (最近一次回复的帖子 ID, 时间)：后到的图片直接补进这层回复
+        self._last_reply_post: dict[int, tuple[int, float]] = {}
         # "topic:12" / "chat:3" -> 待随下一条回复一起发送的图片
         self._pending_images: dict[str, list[str]] = {}
         self._image_flush_tasks: dict[str, asyncio.Task] = {}
@@ -570,6 +598,12 @@ class DiscourseAdapter(Platform):
             await self._sync_notifications()
             return
 
+        # Discourse 的推送结构是 {"notification": {...}, "recent": [...], ...}，
+        # 真正的通知体在 notification 字段里；直接取 id 会永远读到 0。
+        inner = last.get("notification")
+        if isinstance(inner, dict):
+            last = inner
+
         notification_id = _as_int(last.get("id"))
         if notification_id <= self._last_seen_notification_id:
             return
@@ -597,8 +631,10 @@ class DiscourseAdapter(Platform):
                 return
         if not isinstance(payload, dict):
             return
-        if str(payload.get("type") or "") not in ("sent", "processed"):
-            # reaction / edit / delete 等事件不需要转成消息
+        event_type = str(payload.get("type") or "")
+        # "sent" 推送里的 mentioned_users 恒为空，只有 "processed" 才带完整提及信息，
+        # 否则公共频道被 @ 也识别不出来（只会当成普通群消息，不会唤醒）。
+        if event_type != "processed":
             return
 
         message = payload.get("chat_message") or payload.get("message")
@@ -968,7 +1004,8 @@ class DiscourseAdapter(Platform):
             content = html_to_text(str(message.get("cooked") or "")).strip()
         if not content:
             content = str(message.get("excerpt") or "").strip()
-        if not content:
+        image_urls = self._chat_image_urls(message)
+        if not content and not image_urls:
             logger.info("[DiscourseAdapter] 聊天消息 %s 没有文本内容，跳过", message_id)
             return
         if len(content) > 3000:
@@ -990,10 +1027,13 @@ class DiscourseAdapter(Platform):
             if channel_title:
                 abm.group.group_name = channel_title
         abm.message_id = f"discourse_chat_{source_id or message_id}"
-        components = [Plain(text=message_str)]
+        components = [Plain(text=message_str)] if message_str else []
         if mentioned and not is_dm:
             # 群聊里被提及：补一个 At 自己，让 AstrBot 按群聊规则唤醒
             components.insert(0, At(qq=str(self.platform_id), name=self._self_username or None))
+        for url in image_urls:
+            # 图片交给多模态模型，纯文字模型会自动忽略
+            components.append(Image(file=url))
         abm.message = components
         abm.message_str = message_str
         abm.raw_message = message
@@ -1013,6 +1053,26 @@ class DiscourseAdapter(Platform):
             channel_title or channel_id,
             notification_type,
         )
+
+    def _chat_image_urls(self, message: dict) -> list[str]:
+        """从聊天消息的 cooked / markdown 里提取可下载的图片地址。"""
+        found: list[str] = []
+        found.extend(self.CHAT_IMG_TAG_RE.findall(str(message.get("cooked") or "")))
+        found.extend(self.CHAT_IMG_MD_RE.findall(str(message.get("message") or "")))
+        urls: list[str] = []
+        for raw in found:
+            url = unescape(str(raw or "").strip())
+            if url.startswith("upload://"):
+                # 短地址交给 cooked 里的真实地址，避免下载失败
+                continue
+            if url.startswith("//"):
+                url = f"https:{url}"
+            elif url.startswith("/"):
+                url = f"{self.site_url}{url}"
+            if not url.startswith("http") or url in urls:
+                continue
+            urls.append(url)
+        return urls[:4]
 
     def _note_rate_limit(self, exc: Exception) -> None:
         """429 时按论坛给的 Retry-After 暂停轮询；连续命中则指数退避。"""
@@ -1341,6 +1401,49 @@ class DiscourseAdapter(Platform):
             task.cancel()
         return "\n\n".join(parts)
 
+    def remember_reply_post(self, topic_id: int, post_id: int) -> None:
+        """记下刚发出的回复，后到的图片优先补进这一层。"""
+        topic_id = int(topic_id or 0)
+        post_id = int(post_id or 0)
+        if topic_id > 0 and post_id > 0:
+            self._last_reply_post[topic_id] = (post_id, time.time())
+
+    async def _append_images_to_last_reply(self, topic_id: int, markdown: str) -> bool:
+        """把迟到的图片补进最近一条回复（编辑原帖），避免多出一层。"""
+        record = self._last_reply_post.get(int(topic_id or 0))
+        if not record:
+            return False
+        post_id, sent_at = record
+        if time.time() - sent_at > self.IMAGE_MERGE_WINDOW:
+            self._last_reply_post.pop(int(topic_id), None)
+            return False
+        try:
+            post = await self.api.post(post_id, self.credential)
+        except DiscourseError as exc:
+            logger.info(
+                "[DiscourseAdapter] 读取上次回复 %s 失败，改为单独发图：%s",
+                post_id,
+                exc.message,
+            )
+            return False
+        raw = str(post.get("raw") or "")
+        if not raw or markdown in raw:
+            return False
+        try:
+            await self.api.update_post(self.credential, post_id, f"{raw}\n\n{markdown}")
+        except DiscourseError as exc:
+            logger.warning(
+                "[DiscourseAdapter] 把图片补进回复 %s 失败：%s", post_id, exc.message
+            )
+            return False
+        self._last_reply_post.pop(int(topic_id), None)
+        logger.info(
+            "[DiscourseAdapter] 已把图片补进主题 %s 的回复 #%s",
+            topic_id,
+            post.get("post_number", "?"),
+        )
+        return True
+
     async def _flush_images_later(self, target_key: str) -> None:
         try:
             await asyncio.sleep(self.IMAGE_HOLD_SECONDS)
@@ -1354,7 +1457,7 @@ class DiscourseAdapter(Platform):
         target_id = _as_int(target_key.split(":", 1)[-1])
         if target_key.startswith("chat:"):
             await self.send_to_chat(target_id, markdown)
-        else:
+        elif not await self._append_images_to_last_reply(target_id, markdown):
             await self.send_image_reply(target_id, markdown)
 
     async def send_image_reply(self, topic_id: int, text: str) -> bool:
@@ -1376,13 +1479,14 @@ class DiscourseAdapter(Platform):
             "typing_duration_msecs": self.typing_duration,
         }
         try:
-            await self.api.create_post(self.credential, payload)
+            result = await self.api.create_post(self.credential, payload)
         except DiscourseError as exc:
             logger.warning(
                 "[DiscourseAdapter] 发送图片到主题 %s 失败：%s", topic_id, exc.message
             )
             return False
         self._image_sent_at[topic_id] = now
+        self.remember_reply_post(topic_id, _as_int(result.get("id")))
         logger.info("[DiscourseAdapter] 已发送图片到主题 %s", topic_id)
         return True
 
@@ -1463,6 +1567,7 @@ class DiscourseAdapter(Platform):
         images = self.take_pending_images(f"topic:{topic_id}")
         if images:
             text = f"{text}\n\n{images}"
+        text = dedupe_mentions(text)
         if self.store is not None and self.store.replied_within(
             topic_id, reply_to_post_number, self.DUPLICATE_WINDOW
         ):
@@ -1490,6 +1595,7 @@ class DiscourseAdapter(Platform):
             logger.info("[DiscourseAdapter] 回复主题 %s 已提交，等待审核", topic_id)
         else:
             logger.info("[DiscourseAdapter] 已回复主题 %s", topic_id)
+            self.remember_reply_post(topic_id, _as_int(result.get("id")))
         if self.store is not None and reply_to_post_number:
             self.store.mark_replied(topic_id, reply_to_post_number)
         return True

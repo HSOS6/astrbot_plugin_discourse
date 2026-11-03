@@ -14,7 +14,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, StarTools
 
-from .adapter import _plugin_version
+from .adapter import _plugin_version, dedupe_mentions
 from .discourse_api import DiscourseAPI, DiscourseError, html_to_text
 from .render import (
     format_categories,
@@ -198,9 +198,21 @@ class DiscourseForumPlugin(Star):
                 unique.append(token)
         return unique[:5]
 
-    async def _resolve_mentions(self, mentions: str) -> tuple[str, list[str]]:
-        """校验 @ 的用户名是否存在，返回（@ 后缀, 找不到的用户名）。"""
+    async def _resolve_mentions(
+        self, mentions: str, existing_text: str = ""
+    ) -> tuple[str, list[str]]:
+        """校验 @ 的用户名是否存在，返回（@ 后缀, 找不到的用户名）。
+
+        existing_text 里已经出现过的用户名不再追加，避免同一句里 @ 两次。
+        """
         tokens = self._mention_tokens(mentions)
+        if not tokens:
+            return "", []
+        existing = {
+            name.lower()
+            for name in re.findall(r"@([A-Za-z0-9_.-]{1,60})", existing_text or "")
+        }
+        tokens = [name for name in tokens if name.lower() not in existing]
         if not tokens:
             return "", []
         valid: list[str] = []
@@ -1568,8 +1580,8 @@ class DiscourseForumPlugin(Star):
             images = adapter.take_pending_images(f"topic:{int(topic_id)}")
             if images:
                 raw = f"{raw}\n\n{images}"
-        mention_suffix, missing_users = await self._resolve_mentions(mentions)
-        raw += mention_suffix
+        mention_suffix, missing_users = await self._resolve_mentions(mentions, raw)
+        raw = dedupe_mentions(raw + mention_suffix)
 
         payload = {
             "topic_id": int(topic_id),
@@ -1579,7 +1591,7 @@ class DiscourseForumPlugin(Star):
         if post_number:
             payload["reply_to_post_number"] = int(post_number)
 
-        ok, created, message = await self._submit(credential, payload)
+        ok, created, message = await self._submit(credential, payload, event)
         if ok:
             self._record_write(user_id)
             event.set_extra("discourse_tool_replied", True)
@@ -1599,7 +1611,7 @@ class DiscourseForumPlugin(Star):
         return message
 
     async def _submit(
-        self, credential: dict, payload: dict
+        self, credential: dict, payload: dict, event: AstrMessageEvent | None = None
     ) -> tuple[bool, bool, str]:
         try:
             data = await self.api.create_post(credential, payload)
@@ -1611,6 +1623,14 @@ class DiscourseForumPlugin(Star):
             return True, False, f"已提交，等待论坛审核（{reason}）。审核通过后才会公开显示。"
 
         topic_id = data.get("topic_id")
+        adapter = getattr(event, "adapter", None)
+        if hasattr(adapter, "remember_reply_post"):
+            try:
+                adapter.remember_reply_post(
+                    int(payload.get("topic_id") or 0), int(data.get("id") or 0)
+                )
+            except (TypeError, ValueError):
+                pass
         post_url = self.api.absolute_url(str(data.get("post_url", "")))
         if not post_url and topic_id:
             post_url = self.api.topic_url(int(topic_id))
