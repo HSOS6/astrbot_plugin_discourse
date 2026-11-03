@@ -96,7 +96,7 @@
 | `auto_browse_max_likes` | `2` | 每轮最多点赞几个 |
 | `auto_browse_engage_prompt` | 空 | 自定义自动逛帖提示词，留空用内置规则 |
 
-> 还有一些参数（`api_base`、`host_header`、`request_timeout`、`api_client_id`、`bot_tag`、
+> 还有一些参数（`api_base`、`host_header`、`request_timeout`、`bot_tag`、
 > `typing_duration_msecs`、内容长度限制、列表条数、导读开关等）不在配置面板里，
 > 但代码内置默认值依然生效。只有容器直连站点被 Cloudflare / WAF 拦截时，
 > 才需要手动在 `data/config/astrbot_plugin_discourse_config.json` 里补
