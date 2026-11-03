@@ -153,12 +153,14 @@ class DiscourseAdapter(Platform):
     # 聊天通知类型：chat_mention / chat_message / chat_quoted
     CHAT_TYPES = {29, 30, 33}
     # MessageBus 长轮询：和论坛网页端一样由服务端推送，不再定时拉取
-    BUILD_TAG = "2026-11-02-messagebus"
+    BUILD_TAG = "2026-11-03-rate-limit"
     BUS_LONG_POLL_SECONDS = 25
     # 一次长连接结束后留一点空隙再续订，既能近实时又不会打满每日配额
     BUS_GAP_SECONDS = 5
     CHANNEL_REFRESH_SECONDS = 600
     NOTIFICATION_SYNC_SECONDS = 600
+    # 连续 429 时的最长退避：额度用完就歇着，别反复试探
+    RATE_LIMIT_MAX_BACKOFF = 1800
     # 其它插件发来的图片，先暂存这么久，等随下一条回复一起发；没等到就单独发
     IMAGE_HOLD_SECONDS = 15
 
@@ -226,6 +228,8 @@ class DiscourseAdapter(Platform):
         self._chat_poll_disabled = False
         # 被论坛限流（429）时暂停轮询到该时间点
         self._rate_limited_until = 0.0
+        # 连续 429 次数：连续命中就指数退避，成功一次即清零
+        self._rate_limit_hits = 0
         # 聊天频道单独降频轮询，避免和通知一起把请求数打满
         self._next_chat_poll = 0.0
         # MessageBus 长轮询状态：客户端 ID、序号、各频道已收到的 message_id
@@ -323,6 +327,7 @@ class DiscourseAdapter(Platform):
             try:
                 received = await self._bus_poll_once()
                 self._bus_failures = 0
+                self._rate_limit_hits = 0
             except asyncio.CancelledError:
                 raise
             except DiscourseError as exc:
@@ -1010,17 +1015,30 @@ class DiscourseAdapter(Platform):
         )
 
     def _note_rate_limit(self, exc: Exception) -> None:
-        """429 时按论坛给的 Retry-After 暂停轮询，退避期间不再发请求。"""
+        """429 时按论坛给的 Retry-After 暂停轮询；连续命中则指数退避。"""
         if getattr(exc, "status", None) != 429:
             return
         try:
             seconds = float(getattr(exc, "retry_after", 0) or 0)
         except (TypeError, ValueError):
             seconds = 0.0
-        delay = max(30.0, seconds)
+        self._rate_limit_hits += 1
+        backoff = min(
+            self.RATE_LIMIT_MAX_BACKOFF,
+            30.0 * (2 ** min(self._rate_limit_hits - 1, 6)),
+        )
+        delay = max(backoff, seconds)
+        if seconds >= 600:
+            logger.warning(
+                "[DiscourseAdapter] 论坛 429 且要求等待 %.0f 秒，通常是当天额度已用完；"
+                "请在论坛插件的 AstrBot 额度设置里调高每分钟/每天上限",
+                seconds,
+            )
         self._rate_limited_until = max(self._rate_limited_until, time.time() + delay)
         logger.warning(
-            "[DiscourseAdapter] 触发论坛限流，暂停轮询 %.0f 秒", delay
+            "[DiscourseAdapter] 触发论坛限流（第 %s 次），暂停轮询 %.0f 秒",
+            self._rate_limit_hits,
+            delay,
         )
 
     async def _poll_chat_dms(self) -> None:

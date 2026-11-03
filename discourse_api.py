@@ -68,11 +68,10 @@ class DiscourseAPI:
         }
         if credential:
             api_key = str(credential.get("api_key", "")).strip()
-            client_id = str(credential.get("client_id", "")).strip()
             if api_key:
+                # 不发送 User-Api-Client-Id：Discourse 收到和 Key 不匹配的客户端 ID 时，
+                # 会为每个新 ID 新建一条 UserApiKeyClient 记录（连接 ID 越涨越多）。
                 headers["User-Api-Key"] = api_key
-                if client_id:
-                    headers["User-Api-Client-Id"] = client_id
         if self.host_header:
             base_host = urlparse(self.api_base).netloc
             if base_host != self.host_header:
