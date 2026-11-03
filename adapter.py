@@ -1055,8 +1055,12 @@ class DiscourseAdapter(Platform):
         )
 
     def _chat_image_urls(self, message: dict) -> list[str]:
-        """从聊天消息的 cooked / markdown 里提取可下载的图片地址。"""
+        """从聊天消息的 uploads / cooked / markdown 里提取可下载的图片地址。"""
         found: list[str] = []
+        # 聊天消息的图片不在 cooked 里（cooked 只有正文），真正的附件在 uploads 数组里
+        for upload in message.get("uploads") or []:
+            if isinstance(upload, dict):
+                found.append(str(upload.get("url") or upload.get("short_url") or ""))
         found.extend(self.CHAT_IMG_TAG_RE.findall(str(message.get("cooked") or "")))
         found.extend(self.CHAT_IMG_MD_RE.findall(str(message.get("message") or "")))
         urls: list[str] = []
